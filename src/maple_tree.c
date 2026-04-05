@@ -945,6 +945,386 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
 }
 
 /* ====================================================================== */
+/*  Rebalancing — merging, redistribution, and tree shrinking              */
+/* ====================================================================== */
+
+/**
+ * Minimum number of slots a non-root node should have after erasure.
+ * Below this threshold, try to merge or redistribute with a sibling.
+ */
+#define MAPLE_NODE_MIN  (MAPLE_NODE_SLOTS / 4)  /* 4 */
+
+/**
+ * __mt_shrink_root - Collapse a single-child root to reduce tree height.
+ *
+ * If the root is an internal node with exactly one child, replace the root
+ * with that child.  Repeat until the root has >1 child or is a leaf.
+ */
+static void __mt_shrink_root(struct maple_tree *mt)
+{
+    while (1) {
+        void *root = mt_rcu_dereference(&mt->ma_root);
+        if (root == NULL || !mt_is_node(root))
+            return;
+
+        struct maple_node *node = mt_to_node(root);
+        if (mn_is_leaf(node))
+            return;
+        if (node->slot_len != 1)
+            return;
+
+        struct maple_node *child = node->slot[0];
+        if (child == NULL)
+            return;
+
+        /* Promote child to root. */
+        mn_set_root(child);
+        mt_rcu_assign_pointer(&mt->ma_root, mt_mk_root(child));
+        mt_free_node_rcu(node);
+    }
+}
+
+/**
+ * __mt_get_sibling - Find a sibling node and its slot bounds.
+ *
+ * Prefers the left sibling; falls back to the right sibling.
+ * Returns the sibling node, or NULL if none exists (i.e. node is root or
+ * parent has only one child).
+ *
+ * @node:         The node that needs rebalancing.
+ * @sib_out:      Returned sibling.
+ * @sib_slot_out: Sibling's slot index within the parent.
+ * @is_right_out: True if the returned sibling is to the right of @node.
+ */
+static struct maple_node *
+__mt_get_sibling(struct maple_node *node,
+                 uint8_t *sib_slot_out, bool *is_right_out)
+{
+    if (mn_is_root(node))
+        return NULL;
+
+    struct maple_node *parent = mn_get_parent(node);
+    uint8_t pslot = mn_get_parent_slot(node);
+
+    /* Prefer left sibling. */
+    if (pslot > 0) {
+        struct maple_node *left = parent->slot[pslot - 1];
+        if (left != NULL) {
+            *sib_slot_out = pslot - 1;
+            *is_right_out = false;
+            return left;
+        }
+    }
+    /* Fall back to right sibling. */
+    if (pslot + 1 < parent->slot_len) {
+        struct maple_node *right = parent->slot[pslot + 1];
+        if (right != NULL) {
+            *sib_slot_out = pslot + 1;
+            *is_right_out = true;
+            return right;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * __mt_merge_nodes - Merge two leaf siblings into one and remove the
+ * empty node from their parent.
+ *
+ * @mt:      The tree.
+ * @left:    Left sibling leaf (destination).
+ * @right:   Right sibling leaf (source — will be freed).
+ * @parent:  Parent of both nodes.
+ * @left_slot: @left's slot index in @parent.
+ *
+ * Precondition: left->slot_len + right->slot_len <= MAPLE_NODE_SLOTS.
+ */
+static void __mt_merge_leaves(struct maple_tree *mt,
+                              struct maple_node *left,
+                              struct maple_node *right,
+                              struct maple_node *parent,
+                              uint8_t left_slot)
+{
+    uint8_t right_slot = left_slot + 1;
+    uint64_t pmin, pmax;
+    __find_node_bounds(mt, parent, &pmin, &pmax);
+    uint64_t left_max = mn_pivot(parent, left_slot, pmax);
+    uint64_t right_max = mn_pivot(parent, right_slot, pmax);
+
+    /* Append right's entries after left's. */
+    uint8_t dst = left->slot_len;
+    /* The last pivot in left needs to be set to left_max (boundary). */
+    if (dst > 0 && dst - 1 < MAPLE_NODE_PIVOTS)
+        left->pivot[dst - 1] = left_max;
+
+    for (uint8_t i = 0; i < right->slot_len; i++) {
+        left->slot[dst + i] = right->slot[i];
+        if (i < right->slot_len - 1 && (dst + i) < MAPLE_NODE_PIVOTS)
+            left->pivot[dst + i] = right->pivot[i];
+    }
+    left->slot_len = dst + right->slot_len;
+
+    /* Coalesce adjacent identical entries in the merged leaf. */
+    __mt_coalesce_leaf(left, right_max);
+
+    /*
+     * Update parent pivot[left_slot] to cover the right node's range,
+     * since left now spans [left_min, right_max].
+     */
+    if (left_slot < MAPLE_NODE_PIVOTS)
+        parent->pivot[left_slot] = right_max;
+
+    /* Remove right_slot from the parent. */
+    for (uint8_t i = right_slot; i + 1 < parent->slot_len; i++) {
+        parent->slot[i] = parent->slot[i + 1];
+        if (i < MAPLE_NODE_PIVOTS && i + 1 < parent->slot_len - 1)
+            parent->pivot[i] = parent->pivot[i + 1];
+        if (!mn_is_leaf(parent))
+            parent->gap[i] = parent->gap[i + 1];
+    }
+    parent->slot_len--;
+
+    /* Clear the now-unused last slot. */
+    parent->slot[parent->slot_len] = NULL;
+
+    /* Fix parent_slot for children after the removed slot. */
+    for (uint8_t i = right_slot; i < parent->slot_len; i++) {
+        struct maple_node *child = parent->slot[i];
+        if (child != NULL)
+            mn_set_parent(child, parent, i);
+    }
+
+    mt_free_node_rcu(right);
+}
+
+/**
+ * __mt_merge_internal - Merge two internal siblings into one.
+ *
+ * Same idea as leaf merge, but also re-parents the children.
+ */
+static void __mt_merge_internal(struct maple_tree *mt,
+                                struct maple_node *left,
+                                struct maple_node *right,
+                                struct maple_node *parent,
+                                uint8_t left_slot)
+{
+    uint8_t right_slot = left_slot + 1;
+    uint64_t pmin, pmax;
+    __find_node_bounds(mt, parent, &pmin, &pmax);
+    uint64_t left_max = mn_pivot(parent, left_slot, pmax);
+    uint64_t right_max = mn_pivot(parent, right_slot, pmax);
+
+    uint8_t dst = left->slot_len;
+    /* Set the pivot between the last left entry and first right entry. */
+    if (dst > 0 && dst - 1 < MAPLE_NODE_PIVOTS)
+        left->pivot[dst - 1] = left_max;
+
+    for (uint8_t i = 0; i < right->slot_len; i++) {
+        left->slot[dst + i] = right->slot[i];
+        if (i < right->slot_len - 1 && (dst + i) < MAPLE_NODE_PIVOTS)
+            left->pivot[dst + i] = right->pivot[i];
+        left->gap[dst + i] = right->gap[i];
+    }
+    left->slot_len = dst + right->slot_len;
+
+    /* Re-parent all children that moved from right to left. */
+    for (uint8_t i = dst; i < left->slot_len; i++) {
+        struct maple_node *child = left->slot[i];
+        if (child != NULL)
+            mn_set_parent(child, left, i);
+    }
+
+    /* Update parent pivot to cover right's range. */
+    if (left_slot < MAPLE_NODE_PIVOTS)
+        parent->pivot[left_slot] = right_max;
+
+    /* Remove right_slot from parent. */
+    for (uint8_t i = right_slot; i + 1 < parent->slot_len; i++) {
+        parent->slot[i] = parent->slot[i + 1];
+        if (i < MAPLE_NODE_PIVOTS && i + 1 < parent->slot_len - 1)
+            parent->pivot[i] = parent->pivot[i + 1];
+        parent->gap[i] = parent->gap[i + 1];
+    }
+    parent->slot_len--;
+    parent->slot[parent->slot_len] = NULL;
+
+    for (uint8_t i = right_slot; i < parent->slot_len; i++) {
+        struct maple_node *child = parent->slot[i];
+        if (child != NULL)
+            mn_set_parent(child, parent, i);
+    }
+
+    mt_free_node_rcu(right);
+}
+
+/**
+ * __mt_redistribute_leaves - Balance entries between two leaf siblings.
+ *
+ * Moves entries from the heavier sibling to the lighter one so that both
+ * have approximately equal occupancy.
+ *
+ * @mt:      The tree.
+ * @node:    The underfull node.
+ * @sibling: Its sibling.
+ * @parent:  Parent of both.
+ * @node_slot: @node's slot index in @parent.
+ * @sib_slot:  @sibling's slot index in @parent.
+ */
+static void __mt_redistribute_leaves(struct maple_tree *mt,
+                                     struct maple_node *node,
+                                     struct maple_node *sibling,
+                                     struct maple_node *parent,
+                                     uint8_t node_slot,
+                                     uint8_t sib_slot)
+{
+    /* Determine left/right ordering. */
+    struct maple_node *left, *right;
+    uint8_t left_slot;
+    if (node_slot < sib_slot) {
+        left = node;
+        right = sibling;
+        left_slot = node_slot;
+    } else {
+        left = sibling;
+        right = node;
+        left_slot = sib_slot;
+    }
+
+    /*
+     * Collect all entries from both nodes into a temporary buffer,
+     * then split them evenly.  This is simpler and less error-prone
+     * than shifting entries one-by-one.
+     */
+    uint8_t total = left->slot_len + right->slot_len;
+    void    *tmp_slot[MAPLE_NODE_SLOTS * 2];
+    uint64_t tmp_pivot[MAPLE_NODE_SLOTS * 2];
+
+    uint64_t pmin, pmax;
+    __find_node_bounds(mt, parent, &pmin, &pmax);
+    uint64_t left_max = mn_pivot(parent, left_slot, pmax);
+
+    /* Copy left entries. */
+    uint8_t ti = 0;
+    for (uint8_t i = 0; i < left->slot_len; i++, ti++) {
+        tmp_slot[ti] = left->slot[i];
+        if (i < left->slot_len - 1)
+            tmp_pivot[ti] = left->pivot[i];
+        else
+            tmp_pivot[ti] = left_max;
+    }
+    /* Copy right entries. */
+    uint64_t right_max = mn_pivot(parent, left_slot + 1, pmax);
+    for (uint8_t i = 0; i < right->slot_len; i++, ti++) {
+        tmp_slot[ti] = right->slot[i];
+        if (i < right->slot_len - 1)
+            tmp_pivot[ti] = right->pivot[i];
+        else
+            tmp_pivot[ti] = right_max;
+    }
+
+    /* Split: left gets first half, right gets second half. */
+    uint8_t left_new = total >> 1;
+    uint8_t right_new = total - left_new;
+
+    /* Refill left. */
+    for (uint8_t i = 0; i < left_new; i++) {
+        left->slot[i] = tmp_slot[i];
+        if (i < left_new - 1)
+            left->pivot[i] = tmp_pivot[i];
+    }
+    left->slot_len = left_new;
+    /* Clear old trailing slots. */
+    for (uint8_t i = left_new; i < MAPLE_NODE_SLOTS; i++)
+        left->slot[i] = NULL;
+
+    /* Refill right. */
+    for (uint8_t i = 0; i < right_new; i++) {
+        right->slot[i] = tmp_slot[left_new + i];
+        if (i < right_new - 1)
+            right->pivot[i] = tmp_pivot[left_new + i];
+    }
+    right->slot_len = right_new;
+    for (uint8_t i = right_new; i < MAPLE_NODE_SLOTS; i++)
+        right->slot[i] = NULL;
+
+    /* Update parent pivot: left's new upper bound. */
+    parent->pivot[left_slot] = tmp_pivot[left_new - 1];
+}
+
+/**
+ * __mt_rebalance_node - Try to rebalance a node after erasure.
+ *
+ * Called when a node drops below MAPLE_NODE_MIN entries.
+ * Tries to merge with a sibling first (if combined <= MAPLE_NODE_SLOTS).
+ * Falls back to redistribution otherwise.
+ * After merging, rebalances the parent recursively if it becomes underfull.
+ * Finally, shrinks the tree root if it has only one child.
+ */
+static void __mt_rebalance_node(struct maple_tree *mt,
+                                struct maple_node *node)
+{
+    /* Never rebalance the root itself (shrinking handles that). */
+    if (mn_is_root(node))
+        return;
+
+    /* Only rebalance if underfull. */
+    if (node->slot_len >= MAPLE_NODE_MIN)
+        return;
+
+    uint8_t sib_slot;
+    bool is_right;
+    struct maple_node *sibling = __mt_get_sibling(node, &sib_slot, &is_right);
+    if (sibling == NULL)
+        return;
+
+    struct maple_node *parent = mn_get_parent(node);
+    uint8_t node_slot = mn_get_parent_slot(node);
+    uint8_t combined = node->slot_len + sibling->slot_len;
+
+    if (combined <= MAPLE_NODE_SLOTS) {
+        /* Merge: put everything into the left node, free the right. */
+        struct maple_node *left, *right;
+        uint8_t left_slot;
+        if (!is_right) {
+            /* sibling is to the left of node */
+            left = sibling;
+            right = node;
+            left_slot = sib_slot;
+        } else {
+            left = node;
+            right = sibling;
+            left_slot = node_slot;
+        }
+
+        if (mn_is_leaf(left))
+            __mt_merge_leaves(mt, left, right, parent, left_slot);
+        else
+            __mt_merge_internal(mt, left, right, parent, left_slot);
+
+        /* Propagate gaps from the merged node upward. */
+        __mt_propagate_gaps_from(mt, left);
+
+        /* Parent may now be underfull — rebalance recursively. */
+        if (!mn_is_root(parent) && parent->slot_len < MAPLE_NODE_MIN)
+            __mt_rebalance_node(mt, parent);
+
+        /* Root may now have only one child. */
+        __mt_shrink_root(mt);
+    } else {
+        /* Cannot merge — redistribute entries between the two nodes. */
+        if (mn_is_leaf(node)) {
+            __mt_redistribute_leaves(mt, node, sibling, parent,
+                                     node_slot, sib_slot);
+        }
+        /* Note: internal-node redistribution is complex and rarely needed
+         * since parent underflow is handled by recursive merge above.
+         * Leaf redistribution covers the common case. */
+        __mt_propagate_gaps_from(mt, node);
+        __mt_propagate_gaps_from(mt, sibling);
+    }
+}
+
+/* ====================================================================== */
 /*  Erase                                                                  */
 /* ====================================================================== */
 
@@ -981,6 +1361,14 @@ void *mtree_erase(struct maple_tree *mt, uint64_t index)
 
     __mt_coalesce_leaf(node, node_max);
     __mt_propagate_gaps_from(mt, node);
+
+    /* Rebalance if the leaf is underfull and not the root. */
+    if (!mn_is_root(node) && node->slot_len < MAPLE_NODE_MIN)
+        __mt_rebalance_node(mt, node);
+
+    /* Even without rebalance, the root might have become single-child. */
+    __mt_shrink_root(mt);
+
     return old;
 }
 

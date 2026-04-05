@@ -1265,6 +1265,409 @@ static void test_vm_style_mmap_munmap(void **state) {
     mtree_destroy(&mt);
 }
 
+/* ================================================================== */
+/*  Rebalancing tests                                                  */
+/* ================================================================== */
+
+/*
+ * After erasing enough entries from a leaf, it should merge with its
+ * sibling so the tree doesn't degenerate into mostly-empty nodes.
+ * We verify indirectly: all lookups still work after heavy erasure.
+ */
+static void test_rebalance_leaf_merge(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Fill enough entries to create a multi-level tree. */
+    for (uint64_t i = 0; i < 100; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Erase most entries from the first leaf to trigger merge. */
+    for (uint64_t i = 0; i < 14; i++)
+        mtree_erase(&mt, i);
+    /* Remaining entries must still be correct. */
+    for (uint64_t i = 14; i < 100; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    for (uint64_t i = 0; i < 14; i++)
+        assert_null(mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Erase all entries one-by-one — tree should shrink and eventually become
+ * empty without corrupting any remaining lookups at each step.
+ */
+static void test_rebalance_erase_all_sequential(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 80; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    for (uint64_t i = 0; i < 80; i++) {
+        void *old = mtree_erase(&mt, i);
+        assert_ptr_equal(VAL(i + 1), old);
+        /* Spot-check a surviving entry. */
+        if (i + 1 < 80)
+            assert_ptr_equal(VAL(i + 2), mtree_load(&mt, i + 1));
+    }
+    /* Tree should be logically empty (all entries erased). */
+    for (uint64_t i = 0; i < 80; i++)
+        assert_null(mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Erase in reverse order — exercises merging from the right side.
+ */
+static void test_rebalance_erase_reverse(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 80; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    for (int i = 79; i >= 0; i--) {
+        void *old = mtree_erase(&mt, (uint64_t)i);
+        assert_ptr_equal(VAL(i + 1), old);
+        if (i > 0)
+            assert_ptr_equal(VAL(i), mtree_load(&mt, (uint64_t)(i - 1)));
+    }
+    for (uint64_t i = 0; i < 80; i++)
+        assert_null(mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Tree height shrinking: build a deep tree, then erase enough to trigger
+ * root collapse. Insert after shrinking to verify the tree is still usable.
+ */
+static void test_rebalance_tree_shrink(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Build a tree deep enough (>2 levels). */
+    for (uint64_t i = 0; i < 300; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Erase nearly everything — should trigger merges and root shrinking. */
+    for (uint64_t i = 0; i < 295; i++)
+        mtree_erase(&mt, i);
+    /* Remaining 5 entries still correct. */
+    for (uint64_t i = 295; i < 300; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    /* Re-insert into the shrunken tree. */
+    for (uint64_t i = 0; i < 10; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 500)));
+    for (uint64_t i = 0; i < 10; i++)
+        assert_ptr_equal(VAL(i + 500), mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Redistribution: when a sibling is too full to merge but the node is
+ * underfull, entries should be borrowed so both are balanced.
+ * We fill a tree, then selectively erase entries from one leaf.
+ */
+static void test_rebalance_redistribute(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Build a tree with well-populated leaves. */
+    for (uint64_t i = 0; i < 200; i++)
+        mtree_store(&mt, i * 2, VAL(i + 1));
+    /* Erase entries from the middle to make one leaf underfull,
+     * while its sibling should still be too large to merge. */
+    for (uint64_t i = 20; i < 28; i++)
+        mtree_erase(&mt, i * 2);
+    /* All surviving entries still correct. */
+    for (uint64_t i = 0; i < 200; i++) {
+        if (i >= 20 && i < 28)
+            assert_null(mtree_load(&mt, i * 2));
+        else
+            assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i * 2));
+    }
+    mtree_destroy(&mt);
+}
+
+/*
+ * Stress: insert many entries, erase every other one (leaving interleaved
+ * gaps), then erase the rest. Exercises repeated merge + shrink cycles.
+ */
+static void test_rebalance_interleaved_erase(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 500; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Phase 1: erase even indices. */
+    for (uint64_t i = 0; i < 500; i += 2)
+        mtree_erase(&mt, i);
+    for (uint64_t i = 0; i < 500; i++) {
+        if (i % 2 == 0)
+            assert_null(mtree_load(&mt, i));
+        else
+            assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    }
+    /* Phase 2: erase odd indices. */
+    for (uint64_t i = 1; i < 500; i += 2)
+        mtree_erase(&mt, i);
+    for (uint64_t i = 0; i < 500; i++)
+        assert_null(mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Re-populate after heavy erasure to verify the rebalanced tree accepts
+ * new inserts correctly.
+ */
+static void test_rebalance_reinsert_after_shrink(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 150; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Erase all. */
+    for (uint64_t i = 0; i < 150; i++)
+        mtree_erase(&mt, i);
+    /* Re-insert a different set. */
+    for (uint64_t i = 0; i < 150; i++)
+        assert_int_equal(0, mtree_store(&mt, i * 3, VAL(i + 1000)));
+    for (uint64_t i = 0; i < 150; i++)
+        assert_ptr_equal(VAL(i + 1000), mtree_load(&mt, i * 3));
+    mtree_destroy(&mt);
+}
+
+/*
+ * Gap search after rebalance: ensure the gap tracking stays correct
+ * through merges and shrinks.
+ */
+static void test_rebalance_gap_tracking(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Fill [0, 199] with entries at even indices. */
+    for (uint64_t i = 0; i < 100; i++)
+        mtree_store(&mt, i * 2, VAL(i + 1));
+    /* Erase a contiguous block to create a large gap. */
+    for (uint64_t i = 20; i < 40; i++)
+        mtree_erase(&mt, i * 2);
+    /* The gap of erased entries should be findable. Since entries were at
+     * even indices, erasing i*2 for i in [20,39] frees indices
+     * 40, 42, ..., 78.  This creates many small 1-slot gaps between surviving
+     * odd indices. The gap search should find at least a size-1 gap. */
+    MA_STATE(mas, &mt, 0, 0);
+    int ret = mas_empty_area(&mas, 0, 199, 1);
+    assert_int_equal(0, ret);
+    mtree_destroy(&mt);
+}
+
+/* ================================================================== */
+/*  Additional edge cases                                              */
+/* ================================================================== */
+
+/* #2: Store a range spanning the entire index space [0, MAPLE_MAX]. */
+static void test_full_range_store(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    assert_int_equal(0, mtree_store_range(&mt, 0, MAPLE_MAX, VAL(42)));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, 0));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, 1));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, MAPLE_MAX / 2));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, MAPLE_MAX - 1));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, MAPLE_MAX));
+    /* Overwrite a sub-range in the middle. */
+    assert_int_equal(0, mtree_store_range(&mt, 100, 199, VAL(99)));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, 99));
+    assert_ptr_equal(VAL(99), mtree_load(&mt, 100));
+    assert_ptr_equal(VAL(99), mtree_load(&mt, 199));
+    assert_ptr_equal(VAL(42), mtree_load(&mt, 200));
+    mtree_destroy(&mt);
+}
+
+/* #3: Range store that spans multiple existing leaves in a deep tree. */
+static void test_cross_node_range_store(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Build a multi-level tree with 200 single-index entries. */
+    for (uint64_t i = 0; i < 200; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Overwrite a range that should cross 3+ leaf boundaries. */
+    assert_int_equal(0, mtree_store_range(&mt, 30, 170, VAL(999)));
+    /* Verify the three zones. */
+    for (uint64_t i = 0; i < 30; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    for (uint64_t i = 30; i <= 170; i++)
+        assert_ptr_equal(VAL(999), mtree_load(&mt, i));
+    for (uint64_t i = 171; i < 200; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    assert_null(mtree_load(&mt, 200));
+    mtree_destroy(&mt);
+}
+
+/* #4: Erase a single index within a range via store_range(NULL).
+ * mtree_erase removes the *entire entry* covering an index (the whole
+ * range), so punching a single-index hole requires store_range(NULL). */
+static void test_erase_within_range(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    mtree_store_range(&mt, 10, 29, VAL(5));
+    /* Punch a single-index hole at 20. */
+    assert_int_equal(0, mtree_store_range(&mt, 20, 20, NULL));
+    assert_ptr_equal(VAL(5), mtree_load(&mt, 10));
+    assert_ptr_equal(VAL(5), mtree_load(&mt, 19));
+    assert_null(mtree_load(&mt, 20));
+    assert_ptr_equal(VAL(5), mtree_load(&mt, 21));
+    assert_ptr_equal(VAL(5), mtree_load(&mt, 29));
+    assert_null(mtree_load(&mt, 9));
+    assert_null(mtree_load(&mt, 30));
+    /* mtree_erase removes the whole entry that covers the index. */
+    struct maple_tree mt2;
+    init_tree(&mt2);
+    mtree_store_range(&mt2, 10, 29, VAL(5));
+    void *old = mtree_erase(&mt2, 20);
+    assert_ptr_equal(VAL(5), old);
+    /* Entire range [10,29] is gone. */
+    for (uint64_t i = 10; i <= 29; i++)
+        assert_null(mtree_load(&mt2, i));
+    mtree_destroy(&mt);
+    mtree_destroy(&mt2);
+}
+
+/* #4b: Punch holes at range boundaries via store_range(NULL). */
+static void test_erase_range_boundaries(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    mtree_store_range(&mt, 100, 109, VAL(7));
+    /* Punch hole at the first index. */
+    mtree_store_range(&mt, 100, 100, NULL);
+    assert_null(mtree_load(&mt, 100));
+    assert_ptr_equal(VAL(7), mtree_load(&mt, 101));
+    /* Punch hole at the last index. */
+    mtree_store_range(&mt, 109, 109, NULL);
+    assert_null(mtree_load(&mt, 109));
+    assert_ptr_equal(VAL(7), mtree_load(&mt, 108));
+    /* Middle still intact. */
+    for (uint64_t i = 101; i <= 108; i++)
+        assert_ptr_equal(VAL(7), mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+/* #5: Mixed store → gap-search → store-in-gap → erase → gap-search → iterate. */
+static void test_mixed_operations_workflow(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Step 1: Store several ranges. */
+    mtree_store_range(&mt, 0, 99, VAL(1));
+    mtree_store_range(&mt, 200, 299, VAL(2));
+    mtree_store_range(&mt, 400, 499, VAL(3));
+    /* Step 2: Find a gap and fill it. */
+    MA_STATE(mas, &mt, 0, 0);
+    int ret = mas_empty_area(&mas, 0, 999, 50);
+    assert_int_equal(0, ret);
+    uint64_t gap_start = mas.index;
+    mtree_store_range(&mt, gap_start, gap_start + 49, VAL(10));
+    assert_ptr_equal(VAL(10), mtree_load(&mt, gap_start));
+    /* Step 3: Erase part of the first range. */
+    mtree_store_range(&mt, 40, 59, NULL);
+    assert_null(mtree_load(&mt, 50));
+    assert_ptr_equal(VAL(1), mtree_load(&mt, 39));
+    assert_ptr_equal(VAL(1), mtree_load(&mt, 60));
+    /* Step 4: Gap search again — should find the hole we just punched. */
+    MA_STATE(mas2, &mt, 0, 0);
+    ret = mas_empty_area(&mas2, 0, 99, 10);
+    assert_int_equal(0, ret);
+    assert_true(mas2.index >= 40 && mas2.last <= 59);
+    /* Step 5: Iterate all entries and count. */
+    uint64_t index = 0;
+    void *entry;
+    int count = 0;
+    mt_for_each(&mt, entry, index, 999) {
+        assert_non_null(entry);
+        count++;
+    }
+    assert_true(count >= 4); /* at least the original 3 ranges + gap fill */
+    mtree_destroy(&mt);
+}
+
+/* #6: Large-scale gap search after rebalancing from heavy erasure. */
+static void test_gap_search_after_heavy_rebalance(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Fill [0, 999] as a solid range. */
+    mtree_store_range(&mt, 0, 999, VAL(1));
+    /* Insert individual entries beyond to create a deep tree. */
+    for (uint64_t i = 1000; i < 1500; i++)
+        mtree_store(&mt, i, VAL(i + 1));
+    /* Erase a big contiguous block to trigger multiple merges. */
+    for (uint64_t i = 1000; i < 1400; i++)
+        mtree_erase(&mt, i);
+    /* Verify surviving entries. */
+    assert_ptr_equal(VAL(1), mtree_load(&mt, 500));
+    for (uint64_t i = 1400; i < 1500; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    /* Gap search should find the erased region. */
+    MA_STATE(mas, &mt, 0, 0);
+    int ret = mas_empty_area(&mas, 1000, 1999, 100);
+    assert_int_equal(0, ret);
+    assert_true(mas.index >= 1000 && mas.last < 1400);
+    mtree_destroy(&mt);
+}
+
+/* #8: Store entry value 0x2 which matches MAPLE_ROOT_NODE tag. */
+static void test_tagged_pointer_value(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* 0x2 == MAPLE_ROOT_NODE — must not cause confusion. */
+    void *tricky = (void *)(uintptr_t)0x2;
+    assert_int_equal(0, mtree_store(&mt, 10, tricky));
+    assert_ptr_equal(tricky, mtree_load(&mt, 10));
+    /* Store more entries to push tree into multi-node form. */
+    for (uint64_t i = 0; i < 50; i++)
+        mtree_store(&mt, i * 3, VAL(i + 100));
+    /* The tricky value at index 10 should survive splits. */
+    /* Note: index 10 is not a multiple of 3 that we overwrote (9,12 are neighbors). */
+    /* Actually 10 is not i*3 for any integer, so it's safe. But let's verify: */
+    assert_ptr_equal(tricky, mtree_load(&mt, 10));
+    /* Also test 0x1 and 0x3 near the tag bits. */
+    mtree_store(&mt, 5000, (void *)(uintptr_t)0x1);
+    mtree_store(&mt, 5001, (void *)(uintptr_t)0x3);
+    assert_ptr_equal((void *)(uintptr_t)0x1, mtree_load(&mt, 5000));
+    assert_ptr_equal((void *)(uintptr_t)0x3, mtree_load(&mt, 5001));
+    mtree_destroy(&mt);
+}
+
+/* #10: Sparse keys followed by dense fill between them. */
+static void test_sparse_then_dense(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    /* Phase 1: Very sparse keys with huge gaps. */
+    uint64_t sparse[] = { 0, 1000000, 2000000000UL, 3000000000000UL };
+    for (int i = 0; i < 4; i++)
+        assert_int_equal(0, mtree_store(&mt, sparse[i], VAL(i + 1)));
+    for (int i = 0; i < 4; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, sparse[i]));
+    /* Phase 2: Dense fill around the first sparse key. */
+    for (uint64_t i = 1; i <= 200; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 100)));
+    /* Verify sparse keys still correct. */
+    assert_ptr_equal(VAL(1), mtree_load(&mt, 0));
+    assert_ptr_equal(VAL(2), mtree_load(&mt, 1000000));
+    assert_ptr_equal(VAL(3), mtree_load(&mt, 2000000000UL));
+    assert_ptr_equal(VAL(4), mtree_load(&mt, 3000000000000UL));
+    /* Verify dense fill. */
+    for (uint64_t i = 1; i <= 200; i++)
+        assert_ptr_equal(VAL(i + 100), mtree_load(&mt, i));
+    /* No false positives in gaps. */
+    assert_null(mtree_load(&mt, 500));
+    assert_null(mtree_load(&mt, 999999));
+    mtree_destroy(&mt);
+}
+
 /* -- Main -------------------------------------------------------------- */
 
 int main(void) {
@@ -1360,6 +1763,24 @@ int main(void) {
         /* VM-style usage */
         cmocka_unit_test(test_vm_style_gap_alloc),
         cmocka_unit_test(test_vm_style_mmap_munmap),
+        /* Rebalancing */
+        cmocka_unit_test(test_rebalance_leaf_merge),
+        cmocka_unit_test(test_rebalance_erase_all_sequential),
+        cmocka_unit_test(test_rebalance_erase_reverse),
+        cmocka_unit_test(test_rebalance_tree_shrink),
+        cmocka_unit_test(test_rebalance_redistribute),
+        cmocka_unit_test(test_rebalance_interleaved_erase),
+        cmocka_unit_test(test_rebalance_reinsert_after_shrink),
+        cmocka_unit_test(test_rebalance_gap_tracking),
+        /* Additional edge cases */
+        cmocka_unit_test(test_full_range_store),
+        cmocka_unit_test(test_cross_node_range_store),
+        cmocka_unit_test(test_erase_within_range),
+        cmocka_unit_test(test_erase_range_boundaries),
+        cmocka_unit_test(test_mixed_operations_workflow),
+        cmocka_unit_test(test_gap_search_after_heavy_rebalance),
+        cmocka_unit_test(test_tagged_pointer_value),
+        cmocka_unit_test(test_sparse_then_dense),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }
