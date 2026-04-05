@@ -1373,6 +1373,18 @@ void *mtree_erase(struct maple_tree *mt, uint64_t index)
 }
 
 /* ====================================================================== */
+/*  Partial erase (single-index hole punch)                                */
+/* ====================================================================== */
+
+void *mtree_erase_index(struct maple_tree *mt, uint64_t index)
+{
+    void *old = mtree_load(mt, index);
+    if (old != NULL)
+        mtree_store_range(mt, index, index, NULL);
+    return old;
+}
+
+/* ====================================================================== */
 /*  Destroy                                                                */
 /* ====================================================================== */
 

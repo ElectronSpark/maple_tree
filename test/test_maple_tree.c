@@ -1512,8 +1512,9 @@ static void test_erase_within_range(void **state) {
     struct maple_tree mt;
     init_tree(&mt);
     mtree_store_range(&mt, 10, 29, VAL(5));
-    /* Punch a single-index hole at 20. */
-    assert_int_equal(0, mtree_store_range(&mt, 20, 20, NULL));
+    /* Punch a single-index hole at 20 using mtree_erase_index. */
+    void *old = mtree_erase_index(&mt, 20);
+    assert_ptr_equal(VAL(5), old);
     assert_ptr_equal(VAL(5), mtree_load(&mt, 10));
     assert_ptr_equal(VAL(5), mtree_load(&mt, 19));
     assert_null(mtree_load(&mt, 20));
@@ -1525,27 +1526,31 @@ static void test_erase_within_range(void **state) {
     struct maple_tree mt2;
     init_tree(&mt2);
     mtree_store_range(&mt2, 10, 29, VAL(5));
-    void *old = mtree_erase(&mt2, 20);
+    old = mtree_erase(&mt2, 20);
     assert_ptr_equal(VAL(5), old);
     /* Entire range [10,29] is gone. */
     for (uint64_t i = 10; i <= 29; i++)
         assert_null(mtree_load(&mt2, i));
+    /* Erase on a gap returns NULL. */
+    assert_null(mtree_erase_index(&mt2, 15));
     mtree_destroy(&mt);
     mtree_destroy(&mt2);
 }
 
-/* #4b: Punch holes at range boundaries via store_range(NULL). */
+/* #4b: Punch holes at range boundaries via mtree_erase_index. */
 static void test_erase_range_boundaries(void **state) {
     (void)state;
     struct maple_tree mt;
     init_tree(&mt);
     mtree_store_range(&mt, 100, 109, VAL(7));
     /* Punch hole at the first index. */
-    mtree_store_range(&mt, 100, 100, NULL);
+    void *old = mtree_erase_index(&mt, 100);
+    assert_ptr_equal(VAL(7), old);
     assert_null(mtree_load(&mt, 100));
     assert_ptr_equal(VAL(7), mtree_load(&mt, 101));
     /* Punch hole at the last index. */
-    mtree_store_range(&mt, 109, 109, NULL);
+    old = mtree_erase_index(&mt, 109);
+    assert_ptr_equal(VAL(7), old);
     assert_null(mtree_load(&mt, 109));
     assert_ptr_equal(VAL(7), mtree_load(&mt, 108));
     /* Middle still intact. */

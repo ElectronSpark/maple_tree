@@ -368,6 +368,28 @@ static inline int mtree_store(struct maple_tree *mt, uint64_t index,
 void *mtree_erase(struct maple_tree *mt, uint64_t index);
 
 /**
+ * mtree_erase_index - Remove a single index from the tree, preserving
+ *                     the rest of the range.
+ * @mt:    Pointer to the maple tree.
+ * @index: The specific index to remove.
+ *
+ * Unlike mtree_erase(), which removes the *entire* entry whose range
+ * covers @index, this function punches a single-index hole.  The
+ * surrounding range entries are preserved.
+ *
+ * For example, if [10, 29] was stored and mtree_erase_index(mt, 20)
+ * is called, the result is two entries: [10, 19] and [21, 29], each
+ * retaining the original pointer value.  Index 20 becomes a gap.
+ *
+ * If @index is the only index in the entry (a point entry), the
+ * behaviour is identical to mtree_erase().
+ *
+ * Return: The previously stored entry at @index, or NULL if no entry
+ *         covered @index.
+ */
+void *mtree_erase_index(struct maple_tree *mt, uint64_t index);
+
+/**
  * mtree_destroy - Free all nodes in the tree.
  * @mt: Pointer to the maple tree.
  *
@@ -802,6 +824,18 @@ static inline void *mtree_lock_erase(struct maple_tree *mt, uint64_t index)
 {
     mt_lock(mt);
     void *entry = mtree_erase(mt, index);
+    mt_unlock(mt);
+    return entry;
+}
+
+/**
+ * mtree_lock_erase_index - Locked version of mtree_erase_index().
+ */
+static inline void *mtree_lock_erase_index(struct maple_tree *mt,
+                                           uint64_t index)
+{
+    mt_lock(mt);
+    void *entry = mtree_erase_index(mt, index);
     mt_unlock(mt);
     return entry;
 }
