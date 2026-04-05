@@ -1,5 +1,7 @@
 # Maple Tree — Standalone B-tree Library
 
+English | [中文](README.zh-CN.md)
+
 A standalone, portable C implementation of the Linux kernel maple tree data structure. The maple tree is a B-tree optimized for storing non-overlapping index ranges mapping to `void*` entries, with gap tracking for efficient free-range search.
 
 ## Features
@@ -11,6 +13,8 @@ A standalone, portable C implementation of the Linux kernel maple tree data stru
 - **Optional locking**: pluggable write-side serialization
 - **Cursor API** (`ma_state`): efficient sequential access and iteration
 - **Zero external dependencies** beyond libc (and cmocka for tests)
+
+> Full API reference: [API.md](API.md) | [API.zh-CN.md](API.zh-CN.md)
 
 ## Building
 

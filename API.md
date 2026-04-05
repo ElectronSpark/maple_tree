@@ -1,5 +1,7 @@
 # Maple Tree API Reference
 
+English | [中文](API.zh-CN.md)
+
 The maple tree is a B-tree that maps non-overlapping `uint64_t` index ranges
 to `void*` entries.  It features automatic node splitting/merging, gap
 tracking for O(log n) free-range search, and optional RCU-safe reads.
@@ -157,13 +159,28 @@ Remove the **entire** entry whose range contains `index`.
 > **Important:** This removes the whole range, not just the single index.
 > If `[10, 29]` was stored and you call `mtree_erase(mt, 20)`, the entire
 > `[10, 29]` entry is removed.  To punch a single-index hole instead, use
-> `mtree_store_range(mt, 20, 20, NULL)`.
+> `mtree_erase_index(mt, 20)`.
 
 After removal, underfull nodes are rebalanced (merged or redistributed
 with siblings) and the tree height may shrink.
 
 - **Returns:** The previously stored `void*`, or `NULL` if no entry
   covered `index`.
+
+#### `void *mtree_erase_index(struct maple_tree *mt, uint64_t index)`
+
+Remove a single index from the tree, preserving the rest of the range.
+
+Unlike `mtree_erase()`, this function only punches a hole at `index`.
+For example, if `[10, 29]` was stored and `mtree_erase_index(mt, 20)`
+is called, the result is two entries: `[10, 19]` and `[21, 29]`, each
+retaining the original pointer value.  Index 20 becomes a gap.
+
+If `index` is the only index in the entry (a point entry), the behaviour
+is identical to `mtree_erase()`.
+
+- **Returns:** The previously stored entry at `index`, or `NULL` if no
+  entry covered `index`.
 
 #### `void mtree_destroy(struct maple_tree *mt)`
 
@@ -196,7 +213,8 @@ assert(mtree_load(&mt, 100) == NULL);          // gone
 
 // --- Punch a single-index hole instead ---
 mtree_store_range(&mt, 100, 199, region_b);    // re-insert
-mtree_store_range(&mt, 150, 150, NULL);         // only index 150 → NULL
+void *prev = mtree_erase_index(&mt, 150);      // only index 150 removed
+assert(prev == region_b);
 assert(mtree_load(&mt, 149) == region_b);       // still present
 assert(mtree_load(&mt, 150) == NULL);           // hole
 assert(mtree_load(&mt, 151) == region_b);       // still present
@@ -518,6 +536,10 @@ Locked version of `mtree_load()`.
 #### `void *mtree_lock_erase(struct maple_tree *mt, uint64_t index)`
 
 Locked version of `mtree_erase()`.
+
+#### `void *mtree_lock_erase_index(struct maple_tree *mt, uint64_t index)`
+
+Locked version of `mtree_erase_index()`.
 
 #### `void mtree_lock_destroy(struct maple_tree *mt)`
 
