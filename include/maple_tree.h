@@ -1,37 +1,44 @@
 /**
  * @file maple_tree.h
- * @brief Maple tree public API — Linux-style RCU-safe B-tree for ranges.
+ * @brief Maple tree public API — Linux kernel-style B-tree for index ranges.
  *
- * Usage patterns:
+ * The maple tree is a B-tree that maps non-overlapping integer index ranges
+ * to void* entries.  It supports gap tracking for O(log n) free-range
+ * searches, automatic node splitting/merging, and optional RCU-safe reads.
  *
- *   1. Simple API (caller manages external locking for writes):
- *        mtree_store_range(mt, first, last, entry)
- *        mtree_store(mt, index, entry)
- *        mtree_load(mt, index)
- *        mtree_erase(mt, index)
- *        mtree_destroy(mt)
+ * The API is organised into six sections:
  *
- *   2. Cursor API:
- *        MA_STATE(mas, mt, index, last);
- *        mas_walk(&mas)
- *        mas_store(&mas, entry)
- *        mas_erase(&mas)
- *        mas_find(&mas, max)
- *        mas_next(&mas, max)
- *        mas_prev(&mas, min)
+ *   1. **Initialisation**  — Construct and query an empty tree.
+ *   2. **Simple API**      — One-call store/load/erase/destroy by index.
+ *   3. **Cursor API**      — Stateful walk/find/iterate using `ma_state`.
+ *   4. **Gap search**      — Find contiguous free ranges (forward/reverse).
+ *   5. **RCU read-side**   — Lock-free readers (when MT_CONFIG_RCU is set).
+ *   6. **Locked wrappers** — Self-locking convenience (MT_CONFIG_LOCK).
+ *   7. **Iteration macros**— `mt_for_each` / `mas_for_each`.
+ *   8. **Debug**           — Tree-dump for diagnostics.
  *
- *   3. RCU read-side helpers:
- *        mt_find(mt, &index, max)
- *        mt_next(mt, index, max)
- *        mt_prev(mt, index, min)
+ * **Locking contract (default, without locked wrappers)**
  *
- *   4. Gap search:
- *        mas_empty_area(&mas, min, max, size)
- *        mas_empty_area_rev(&mas, min, max, size)
+ *   - Reads  (`mtree_load`, `mt_find`, …) are safe against concurrent
+ *     RCU-protected reads but NOT against concurrent writes unless the
+ *     caller holds an external lock.
+ *   - Writes (`mtree_store*`, `mtree_erase`, `mtree_destroy`) must be
+ *     serialised by the caller — either using mt_lock()/mt_unlock(),
+ *     the mtree_lock_* wrappers, or an external mutex.
  *
- *   5. Iteration:
- *        mt_for_each(mt, entry, index, max)
- *        mas_for_each(mas, entry, max)
+ * **Thread safety quick-start**
+ *
+ *   @code
+ *   // Option A — locked wrappers (simplest, one op at a time):
+ *   mtree_lock_store(&mt, 42, ptr);
+ *   void *v = mtree_lock_load(&mt, 42);
+ *
+ *   // Option B — manual locking (batch multiple ops atomically):
+ *   mt_lock(&mt);
+ *   mtree_store(&mt, 1, a);
+ *   mtree_store(&mt, 2, b);
+ *   mt_unlock(&mt);
+ *   @endcode
  */
 
 #ifndef MAPLE_TREE_H
@@ -42,6 +49,36 @@
 /* ====================================================================== */
 /*  Initialisation                                                         */
 /* ====================================================================== */
+
+/**
+ * @defgroup init Initialisation
+ * @{
+ *
+ * Every maple tree must be initialised before first use.  The
+ * init functions zero the root pointer and set up optional locking.
+ *
+ * **Functions:**
+ *   - mt_init()       — basic initialisation
+ *   - mt_init_flags() — initialisation with feature flags
+ *   - mt_empty()      — test whether the tree has any entries
+ *
+ * **Using together:**
+ *
+ * @code
+ * struct maple_tree mt;
+ * mt_init(&mt);                   // or mt_init_flags(&mt, flags)
+ * assert(mt_empty(&mt));          // tree starts empty
+ *
+ * mtree_store(&mt, 0, ptr);       // now it has an entry
+ * assert(!mt_empty(&mt));
+ *
+ * mtree_destroy(&mt);             // free all nodes
+ * assert(mt_empty(&mt));          // empty again — can be re-used
+ * mt_init(&mt);                   // re-init if you want to reuse
+ * @endcode
+ *
+ * @}
+ */
 
 /**
  * mt_init - Initialise an empty maple tree.
@@ -90,6 +127,40 @@ static inline bool mt_empty(const struct maple_tree *mt)
 /*  Locking helpers                                                        */
 /* ====================================================================== */
 
+/**
+ * @defgroup locking Locking helpers
+ * @{
+ *
+ * Low-level lock/unlock for the per-tree mutex.  These are building
+ * blocks — most callers should prefer the mtree_lock_* wrappers
+ * (see @ref locked_wrappers) for single-operation locking, or use
+ * mt_lock()/mt_unlock() directly only when batching multiple
+ * operations under one critical section.
+ *
+ * When MT_CONFIG_LOCK is **not** defined, both functions compile to
+ * no-ops so code remains portable.
+ *
+ * **Functions:**
+ *   - mt_lock()   — acquire the tree lock
+ *   - mt_unlock() — release the tree lock
+ *
+ * **Using together:**
+ *
+ * @code
+ * // Batch several writes atomically:
+ * mt_lock(&mt);
+ * mtree_store(&mt, 10, a);
+ * mtree_store(&mt, 20, b);
+ * void *old = mtree_erase(&mt, 5);
+ * mt_unlock(&mt);
+ *
+ * // Single-operation alternative (no manual lock):
+ * mtree_lock_store(&mt, 10, a);
+ * @endcode
+ *
+ * @}
+ */
+
 #ifdef MT_CONFIG_LOCK
 
 /**
@@ -123,6 +194,38 @@ static inline void mt_unlock(struct maple_tree *mt) { (void)mt; }
 /*  RCU helpers                                                            */
 /* ====================================================================== */
 
+/**
+ * @defgroup rcu RCU read-side helpers
+ * @{
+ *
+ * Enter/leave an RCU read-side critical section.  Required when using
+ * mt_find(), mt_next(), or mt_prev() from multiple reader threads
+ * concurrently with writers that defer node freeing via mt_call_rcu().
+ *
+ * When MT_CONFIG_RCU is **not** defined, both functions compile to
+ * no-ops.
+ *
+ * **Functions:**
+ *   - mt_rcu_lock()   — begin RCU read-side section
+ *   - mt_rcu_unlock() — end RCU read-side section
+ *
+ * **Using together:**
+ *
+ * @code
+ * // Explicit RCU section for cursor-based read:
+ * mt_rcu_lock();
+ * MA_STATE(mas, &mt, 0, 0);
+ * void *entry = mas_find(&mas, UINT64_MAX);
+ * // ... use entry ...
+ * mt_rcu_unlock();
+ *
+ * // mt_find/mt_next/mt_prev acquire RCU internally, so the above
+ * // is only needed when you hold a cursor across multiple calls.
+ * @endcode
+ *
+ * @}
+ */
+
 #ifdef MT_CONFIG_RCU
 
 /**
@@ -146,6 +249,48 @@ static inline void mt_rcu_unlock(void) {}
 /* ====================================================================== */
 /*  Simple API                                                             */
 /* ====================================================================== */
+
+/**
+ * @defgroup simple Simple API
+ * @{
+ *
+ * The simple API provides the most common operations in a single
+ * function call: store a range, load by index, erase, and destroy.
+ * These functions do **not** acquire any lock internally — the caller
+ * must serialise writes via mt_lock() or an external mutex.
+ *
+ * **Functions:**
+ *   - mtree_load()        — point lookup
+ *   - mtree_store_range() — insert/overwrite a contiguous range
+ *   - mtree_store()       — convenience: store at a single index
+ *   - mtree_erase()       — remove the entire entry covering an index
+ *   - mtree_destroy()     — free all internal nodes
+ *
+ * **Using together:**
+ *
+ * @code
+ * struct maple_tree mt;
+ * mt_init(&mt);
+ *
+ * // --- Store entries ---
+ * mtree_store_range(&mt, 100, 199, region_a);   // range [100, 199]
+ * mtree_store(&mt, 42, single_obj);             // single index 42
+ *
+ * // --- Look up ---
+ * void *v = mtree_load(&mt, 150);               // returns region_a
+ * assert(mtree_load(&mt, 50) == NULL);           // gap → NULL
+ *
+ * // --- Erase / hole-punch ---
+ * void *old = mtree_erase(&mt, 150);             // removes ALL of [100,199]
+ * // To punch a one-index hole instead:
+ * mtree_store_range(&mt, 150, 150, NULL);        // only index 150 → NULL
+ *
+ * // --- Cleanup ---
+ * mtree_destroy(&mt);                            // frees nodes, not entries
+ * @endcode
+ *
+ * @}
+ */
 
 /**
  * mtree_load - Look up the entry stored at @index.
@@ -240,6 +385,60 @@ void  mtree_destroy(struct maple_tree *mt);
 /* ====================================================================== */
 
 /**
+ * @defgroup cursor Cursor (ma_state) API
+ * @{
+ *
+ * The cursor API uses a lightweight `struct ma_state` (typically
+ * stack-allocated via the MA_STATE() macro) to track position within
+ * the tree.  It avoids repeated root-to-leaf traversals when
+ * performing sequential operations such as scanning, inserting a
+ * batch of adjacent keys, or mixed read-modify-erase workflows.
+ *
+ * **Functions:**
+ *   - MA_STATE()  — declare and initialise a cursor on the stack
+ *   - mas_walk()  — descend to the slot covering mas->index
+ *   - mas_store() — store an entry at [mas->index, mas->last]
+ *   - mas_erase() — erase the entry covering mas->index
+ *   - mas_find()  — find the next non-NULL entry at/after mas->index
+ *   - mas_next()  — advance one entry forward
+ *   - mas_prev()  — move one entry backward
+ *
+ * **Using together:**
+ *
+ * @code
+ * // --- Walk + conditional update ---
+ * MA_STATE(mas, &mt, target_idx, target_idx);
+ * void *cur = mas_walk(&mas);
+ * if (cur == stale_ptr)
+ *     mas_store(&mas, new_ptr);       // overwrite in-place
+ *
+ * // --- Forward scan with cursor ---
+ * MA_STATE(mas, &mt, 0, 0);
+ * void *entry;
+ * while ((entry = mas_find(&mas, UINT64_MAX)) != NULL) {
+ *     printf("[%lu, %lu] -> %p\n", mas.index, mas.last, entry);
+ * }
+ *
+ * // --- Backward scan ---
+ * MA_STATE(mas, &mt, UINT64_MAX, UINT64_MAX);
+ * mas_walk(&mas);                     // position at the end
+ * void *entry;
+ * while ((entry = mas_prev(&mas, 0)) != NULL) {
+ *     // process entries in reverse
+ * }
+ *
+ * // --- Cursor erase while iterating ---
+ * MA_STATE(mas, &mt, 0, 0);
+ * while ((entry = mas_find(&mas, 1000)) != NULL) {
+ *     if (should_remove(entry))
+ *         mas_erase(&mas);
+ * }
+ * @endcode
+ *
+ * @}
+ */
+
+/**
  * mas_walk - Walk the tree to the entry at mas->index.
  * @mas: Maple state cursor.  On entry, mas->index is the target index.
  *
@@ -316,6 +515,53 @@ void *mas_prev(struct ma_state *mas, uint64_t min);
 /* ====================================================================== */
 
 /**
+ * @defgroup gap Gap search
+ * @{
+ *
+ * Gap-search functions locate contiguous runs of NULL entries (gaps)
+ * within a specified index range.  They use the per-node gap metadata
+ * maintained by the tree to search in O(log n) rather than scanning
+ * every slot.
+ *
+ * These are the workhorses behind VM-style address-space allocators:
+ * find a free region of the requested size and return its bounds.
+ *
+ * **Functions:**
+ *   - mas_empty_area()     — lowest-address first-fit gap search
+ *   - mas_empty_area_rev() — highest-address first-fit gap search
+ *
+ * **Using together:**
+ *
+ * @code
+ * // --- Simple first-fit allocator ---
+ * MA_STATE(mas, &mt, 0, 0);
+ * int ret = mas_empty_area(&mas, 0, UINT64_MAX, page_count);
+ * if (ret == 0) {
+ *     // Found: gap at [mas.index, mas.last] (size >= page_count)
+ *     uint64_t alloc_start = mas.index;
+ *     mtree_store_range(&mt, alloc_start,
+ *                       alloc_start + page_count - 1, region);
+ * }
+ *
+ * // --- Top-down (reverse) allocator ---
+ * MA_STATE(mas, &mt, 0, 0);
+ * ret = mas_empty_area_rev(&mas, 0, UINT64_MAX, page_count);
+ * if (ret == 0) {
+ *     uint64_t alloc_start = mas.index;
+ *     mtree_store_range(&mt, alloc_start,
+ *                       alloc_start + page_count - 1, region);
+ * }
+ *
+ * // --- Free + gap reclaim ---
+ * mtree_store_range(&mt, alloc_start,
+ *                   alloc_start + page_count - 1, NULL);  // free
+ * // Subsequent gap searches will find this region again.
+ * @endcode
+ *
+ * @}
+ */
+
+/**
  * mas_empty_area - Find the first (lowest-address) gap of at least @size.
  * @mas:  Maple state cursor.  On success, mas->index and mas->last are
  *        set to the found gap range [start, start + size - 1].
@@ -352,6 +598,47 @@ int mas_empty_area_rev(struct ma_state *mas, uint64_t min, uint64_t max,
 /* ====================================================================== */
 /*  RCU read-side helpers                                                  */
 /* ====================================================================== */
+
+/**
+ * @defgroup rcu_read RCU read-side traversal
+ * @{
+ *
+ * These functions provide a convenient, self-contained read path that
+ * acquires the RCU read lock internally (when MT_CONFIG_RCU is
+ * enabled).  They are ideal for one-shot lookups or forward/backward
+ * neighbour queries from reader threads that coexist with writers.
+ *
+ * Without MT_CONFIG_RCU, the RCU lock calls compile to no-ops and
+ * these functions behave identically to cursor-based lookups — but
+ * the caller must still serialise against concurrent writes via an
+ * external lock.
+ *
+ * **Functions:**
+ *   - mt_find() — find next non-NULL entry at/after *index
+ *   - mt_next() — entry strictly after index
+ *   - mt_prev() — entry strictly before index
+ *
+ * **Using together:**
+ *
+ * @code
+ * // --- Iterate all entries with mt_find ---
+ * uint64_t idx = 0;
+ * void *entry;
+ * while ((entry = mt_find(&mt, &idx, UINT64_MAX)) != NULL)
+ *     process(entry);        // idx is auto-advanced past each entry
+ *
+ * // --- Get neighbours ---
+ * void *next = mt_next(&mt, current_idx, UINT64_MAX);
+ * void *prev = mt_prev(&mt, current_idx, 0);
+ *
+ * // --- Bounded search ---
+ * // Find the first entry in [1000, 2000]:
+ * uint64_t start = 1000;
+ * void *e = mt_find(&mt, &start, 2000);
+ * @endcode
+ *
+ * @}
+ */
 
 /**
  * mt_find - Find the next non-NULL entry at or after *@index, up to @max.
@@ -397,6 +684,28 @@ void *mt_prev(struct maple_tree *mt, uint64_t index, uint64_t min);
 /* ====================================================================== */
 
 /**
+ * @defgroup debug Debug
+ * @{
+ *
+ * Diagnostic output for inspecting the internal tree structure.
+ * Useful during development and when writing tests — not intended
+ * for production use.
+ *
+ * **Functions:**
+ *   - mt_dump_tree() — print every node to stdout
+ *
+ * **Using together:**
+ *
+ * @code
+ * mtree_store_range(&mt, 0, 99, region);
+ * mtree_store(&mt, 200, single);
+ * mt_dump_tree(&mt);   // shows root, node type, pivots, entries
+ * @endcode
+ *
+ * @}
+ */
+
+/**
  * mt_dump_tree - Print the tree structure to stdout for debugging.
  * @mt: Pointer to the maple tree.
  *
@@ -410,15 +719,47 @@ void mt_dump_tree(struct maple_tree *mt);
 /* ====================================================================== */
 
 /**
+ * @defgroup locked_wrappers Locked convenience wrappers
+ * @{
+ *
  * The mtree_lock_* family acquires the tree's internal lock (when
- * MT_CONFIG_LOCK is defined) around each operation, providing a
- * serialised interface safe for concurrent use from multiple threads.
+ * MT_CONFIG_LOCK is defined) around each operation, providing a fully
+ * serialised interface safe for concurrent use from multiple threads
+ * without any external synchronisation.
  *
  * Without MT_CONFIG_LOCK the lock calls compile to no-ops, so these
  * wrappers remain usable (and equivalent to the plain API).
  *
  * For callers that need to batch several operations atomically, use
  * mt_lock() / mt_unlock() manually around the plain API instead.
+ *
+ * **Functions:**
+ *   - mtree_lock_store_range() — locked version of mtree_store_range()
+ *   - mtree_lock_store()       — locked version of mtree_store()
+ *   - mtree_lock_load()        — locked version of mtree_load()
+ *   - mtree_lock_erase()       — locked version of mtree_erase()
+ *   - mtree_lock_destroy()     — locked version of mtree_destroy()
+ *
+ * **Using together:**
+ *
+ * @code
+ * // Each call is independently thread-safe:
+ * mtree_lock_store(&mt, 1, a);
+ * mtree_lock_store(&mt, 2, b);
+ * void *v = mtree_lock_load(&mt, 1);
+ * mtree_lock_erase(&mt, 2);
+ *
+ * // When no more threads are active:
+ * mtree_lock_destroy(&mt);
+ *
+ * // For atomic batches, drop down to the plain API:
+ * mt_lock(&mt);
+ * mtree_store(&mt, 10, x);
+ * mtree_store(&mt, 11, y);
+ * mt_unlock(&mt);
+ * @endcode
+ *
+ * @}
  */
 
 /**
@@ -480,6 +821,46 @@ static inline void mtree_lock_destroy(struct maple_tree *mt)
 /* ====================================================================== */
 /*  Iteration macros                                                       */
 /* ====================================================================== */
+
+/**
+ * @defgroup iteration Iteration macros
+ * @{
+ *
+ * Convenience macros that wrap the find/cursor functions into
+ * standard C for/while loops.
+ *
+ * **Macros:**
+ *   - mt_for_each()  — iterate all non-NULL entries using mt_find()
+ *   - mas_for_each() — iterate all non-NULL entries using mas_find()
+ *
+ * **Using together:**
+ *
+ * @code
+ * // --- mt_for_each: simple full-tree scan ---
+ * uint64_t idx = 0;
+ * void *entry;
+ * mt_for_each(&mt, entry, idx, UINT64_MAX) {
+ *     printf("entry at range ending before idx=%lu: %p\n", idx, entry);
+ * }
+ *
+ * // --- mas_for_each: cursor-based scan with optional early exit ---
+ * MA_STATE(mas, &mt, 100, 0);     // start scanning from index 100
+ * void *entry;
+ * mas_for_each(&mas, entry, 999) {
+ *     if (some_condition(entry))
+ *         break;                   // cursor remembers position
+ * }
+ * // After break, mas.index/mas.last still reflect the last entry.
+ *
+ * // --- Bounded range dump ---
+ * uint64_t idx = 500;
+ * mt_for_each(&mt, entry, idx, 1000) {
+ *     handle(entry);              // only entries in [500, 1000]
+ * }
+ * @endcode
+ *
+ * @}
+ */
 
 /**
  * mt_for_each - Iterate over all non-NULL entries in [0, @__max].

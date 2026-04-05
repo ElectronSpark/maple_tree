@@ -2,7 +2,7 @@
  * @file maple_tree.c
  * @brief Maple tree implementation — RCU-safe B-tree for index ranges.
  *
- * Ported from xv6 kernel maple_tree.c to standalone C11.
+ * Standalone C11 implementation based on the Linux kernel maple_tree.
  *
  * Design:
  *  - 16 slots per node, 15 pivots.

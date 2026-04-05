@@ -1,6 +1,6 @@
 # Maple Tree — Standalone B-tree Library
 
-A standalone, portable C implementation of the Linux-style maple tree data structure, extracted from the xv6 kernel. The maple tree is a B-tree optimized for storing non-overlapping index ranges mapping to `void*` entries, with gap tracking for efficient free-range search.
+A standalone, portable C implementation of the Linux kernel maple tree data structure. The maple tree is a B-tree optimized for storing non-overlapping index ranges mapping to `void*` entries, with gap tracking for efficient free-range search.
 
 ## Features
 
@@ -132,4 +132,4 @@ mt_for_each(&mt, entry, index, max) {
 
 ## License
 
-Same as xv6 (MIT).
+MIT License.
