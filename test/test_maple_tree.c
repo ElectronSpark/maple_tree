@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #include "maple_tree.h"
 
@@ -1668,6 +1669,306 @@ static void test_sparse_then_dense(void **state) {
     mtree_destroy(&mt);
 }
 
+/* ================================================================== */
+/*  Concurrency stress tests                                           */
+/* ================================================================== */
+
+#define CONC_NUM_THREADS   8
+#define CONC_OPS_PER_THREAD 2000
+#define CONC_KEY_SPACE     5000
+
+struct thread_ctx {
+    struct maple_tree *mt;
+    int thread_id;
+    int errors;
+};
+
+/*
+ * Worker: each thread stores, loads, and erases keys in a shared tree
+ * using the locked API wrappers.  Keys are partitioned so that each
+ * thread "owns" a range, but loads are done across the full key space
+ * to exercise concurrent reads.
+ */
+static void *conc_writer_reader(void *arg)
+{
+    struct thread_ctx *ctx = arg;
+    struct maple_tree *mt = ctx->mt;
+    int id = ctx->thread_id;
+    ctx->errors = 0;
+
+    /* Each thread owns keys [base, base + CONC_OPS_PER_THREAD). */
+    uint64_t base = (uint64_t)id * CONC_OPS_PER_THREAD;
+
+    /* Phase 1: Insert owned keys. */
+    for (uint64_t i = 0; i < CONC_OPS_PER_THREAD; i++) {
+        uint64_t key = base + i;
+        int ret = mtree_lock_store(mt, key, VAL(key + 1));
+        if (ret != 0)
+            ctx->errors++;
+    }
+
+    /* Phase 2: Verify own keys and read-probe other threads' keys. */
+    for (uint64_t i = 0; i < CONC_OPS_PER_THREAD; i++) {
+        uint64_t key = base + i;
+        void *v = mtree_lock_load(mt, key);
+        if (v != VAL(key + 1))
+            ctx->errors++;
+    }
+    /* Read a few keys from another thread's range (may or may not exist yet). */
+    uint64_t other_base = ((uint64_t)((id + 1) % CONC_NUM_THREADS))
+                          * CONC_OPS_PER_THREAD;
+    for (uint64_t i = 0; i < 100; i++)
+        (void)mtree_lock_load(mt, other_base + i);
+
+    /* Phase 3: Erase half of own keys. */
+    for (uint64_t i = 0; i < CONC_OPS_PER_THREAD; i += 2) {
+        uint64_t key = base + i;
+        mtree_lock_erase(mt, key);
+    }
+
+    /* Phase 4: Verify erased keys are NULL, others still present. */
+    for (uint64_t i = 0; i < CONC_OPS_PER_THREAD; i++) {
+        uint64_t key = base + i;
+        void *v = mtree_lock_load(mt, key);
+        if (i % 2 == 0) {
+            if (v != NULL)
+                ctx->errors++;
+        } else {
+            if (v != VAL(key + 1))
+                ctx->errors++;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Parallel writers: all threads insert into partitioned key ranges,
+ * then we verify every key globally.
+ */
+static void test_concurrent_writers(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    pthread_t threads[CONC_NUM_THREADS];
+    struct thread_ctx ctxs[CONC_NUM_THREADS];
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        ctxs[i].mt = &mt;
+        ctxs[i].thread_id = i;
+        ctxs[i].errors = 0;
+        pthread_create(&threads[i], NULL, conc_writer_reader, &ctxs[i]);
+    }
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        pthread_join(threads[i], NULL);
+
+    int total_errors = 0;
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        total_errors += ctxs[i].errors;
+    assert_int_equal(0, total_errors);
+
+    mtree_destroy(&mt);
+}
+
+/*
+ * Contended key space: all threads read and write to the SAME keys,
+ * exercising lock contention on every operation.
+ */
+static void *conc_contended_worker(void *arg)
+{
+    struct thread_ctx *ctx = arg;
+    struct maple_tree *mt = ctx->mt;
+    int id = ctx->thread_id;
+    ctx->errors = 0;
+
+    /* Simple LCG seeded per-thread for varied access patterns. */
+    uint64_t seed = (uint64_t)(id + 1) * 6364136223846793005ULL + 1;
+
+    for (int op = 0; op < CONC_OPS_PER_THREAD; op++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t key = (seed >> 16) % CONC_KEY_SPACE;
+        int action = (seed >> 48) % 3;
+
+        switch (action) {
+        case 0: /* store */
+            mtree_lock_store(mt, key, VAL(key + 1));
+            break;
+        case 1: /* load — value is either correct or NULL (erased by another) */
+            {
+                void *v = mtree_lock_load(mt, key);
+                if (v != NULL && v != VAL(key + 1))
+                    ctx->errors++;
+            }
+            break;
+        case 2: /* erase */
+            mtree_lock_erase(mt, key);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void test_concurrent_contended(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    pthread_t threads[CONC_NUM_THREADS];
+    struct thread_ctx ctxs[CONC_NUM_THREADS];
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        ctxs[i].mt = &mt;
+        ctxs[i].thread_id = i;
+        ctxs[i].errors = 0;
+        pthread_create(&threads[i], NULL, conc_contended_worker, &ctxs[i]);
+    }
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        pthread_join(threads[i], NULL);
+
+    int total_errors = 0;
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        total_errors += ctxs[i].errors;
+    assert_int_equal(0, total_errors);
+
+    mtree_destroy(&mt);
+}
+
+/*
+ * Range-store vs point-erase contention: some threads store ranges
+ * while others erase individual keys within those ranges.
+ */
+static void *conc_range_store_worker(void *arg)
+{
+    struct thread_ctx *ctx = arg;
+    struct maple_tree *mt = ctx->mt;
+    int id = ctx->thread_id;
+    ctx->errors = 0;
+
+    uint64_t base = (uint64_t)id * 500;
+    for (int round = 0; round < 20; round++) {
+        uint64_t first = base + (uint64_t)round * 20;
+        uint64_t last  = first + 9;
+        mtree_lock_store_range(mt, first, last, VAL(first + 1));
+        /* Immediately verify a sample within our own range. */
+        void *v = mtree_lock_load(mt, first + 5);
+        /* Another thread may have erased it already, so accept NULL. */
+        if (v != NULL && v != VAL(first + 1))
+            ctx->errors++;
+    }
+    return NULL;
+}
+
+static void *conc_point_erase_worker(void *arg)
+{
+    struct thread_ctx *ctx = arg;
+    struct maple_tree *mt = ctx->mt;
+    ctx->errors = 0;
+
+    uint64_t seed = (uint64_t)(ctx->thread_id + 100) * 2654435761ULL;
+    for (int op = 0; op < 200; op++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t key = (seed >> 16) % (CONC_NUM_THREADS * 500);
+        mtree_lock_erase(mt, key);
+    }
+    return NULL;
+}
+
+static void test_concurrent_range_vs_erase(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    pthread_t threads[CONC_NUM_THREADS * 2];
+    struct thread_ctx ctxs[CONC_NUM_THREADS * 2];
+
+    /* First half: range store workers. */
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        ctxs[i].mt = &mt;
+        ctxs[i].thread_id = i;
+        ctxs[i].errors = 0;
+        pthread_create(&threads[i], NULL, conc_range_store_worker, &ctxs[i]);
+    }
+    /* Second half: point erase workers. */
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        int idx = CONC_NUM_THREADS + i;
+        ctxs[idx].mt = &mt;
+        ctxs[idx].thread_id = i;
+        ctxs[idx].errors = 0;
+        pthread_create(&threads[idx], NULL, conc_point_erase_worker, &ctxs[idx]);
+    }
+
+    for (int i = 0; i < CONC_NUM_THREADS * 2; i++)
+        pthread_join(threads[i], NULL);
+
+    int total_errors = 0;
+    for (int i = 0; i < CONC_NUM_THREADS * 2; i++)
+        total_errors += ctxs[i].errors;
+    assert_int_equal(0, total_errors);
+
+    mtree_destroy(&mt);
+}
+
+/*
+ * Sequential consistency check: N threads each insert a unique key,
+ * then a barrier, then all threads verify all N keys are present.
+ */
+static pthread_barrier_t g_barrier;
+
+static void *conc_barrier_worker(void *arg)
+{
+    struct thread_ctx *ctx = arg;
+    struct maple_tree *mt = ctx->mt;
+    int id = ctx->thread_id;
+    ctx->errors = 0;
+
+    /* Each thread stores its unique key. */
+    mtree_lock_store(mt, (uint64_t)id * 1000, VAL(id + 1));
+
+    /* Wait for all threads to finish storing. */
+    pthread_barrier_wait(&g_barrier);
+
+    /* All keys from all threads should now be visible. */
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        void *v = mtree_lock_load(mt, (uint64_t)i * 1000);
+        if (v != VAL(i + 1))
+            ctx->errors++;
+    }
+    return NULL;
+}
+
+static void test_concurrent_barrier_visibility(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    pthread_barrier_init(&g_barrier, NULL, CONC_NUM_THREADS);
+
+    pthread_t threads[CONC_NUM_THREADS];
+    struct thread_ctx ctxs[CONC_NUM_THREADS];
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++) {
+        ctxs[i].mt = &mt;
+        ctxs[i].thread_id = i;
+        ctxs[i].errors = 0;
+        pthread_create(&threads[i], NULL, conc_barrier_worker, &ctxs[i]);
+    }
+
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        pthread_join(threads[i], NULL);
+
+    pthread_barrier_destroy(&g_barrier);
+
+    int total_errors = 0;
+    for (int i = 0; i < CONC_NUM_THREADS; i++)
+        total_errors += ctxs[i].errors;
+    assert_int_equal(0, total_errors);
+
+    mtree_destroy(&mt);
+}
+
 /* -- Main -------------------------------------------------------------- */
 
 int main(void) {
@@ -1781,6 +2082,11 @@ int main(void) {
         cmocka_unit_test(test_gap_search_after_heavy_rebalance),
         cmocka_unit_test(test_tagged_pointer_value),
         cmocka_unit_test(test_sparse_then_dense),
+        /* Concurrency stress tests */
+        cmocka_unit_test(test_concurrent_writers),
+        cmocka_unit_test(test_concurrent_contended),
+        cmocka_unit_test(test_concurrent_range_vs_erase),
+        cmocka_unit_test(test_concurrent_barrier_visibility),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

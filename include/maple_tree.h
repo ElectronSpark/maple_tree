@@ -406,6 +406,78 @@ void *mt_prev(struct maple_tree *mt, uint64_t index, uint64_t min);
 void mt_dump_tree(struct maple_tree *mt);
 
 /* ====================================================================== */
+/*  Locked convenience wrappers                                            */
+/* ====================================================================== */
+
+/**
+ * The mtree_lock_* family acquires the tree's internal lock (when
+ * MT_CONFIG_LOCK is defined) around each operation, providing a
+ * serialised interface safe for concurrent use from multiple threads.
+ *
+ * Without MT_CONFIG_LOCK the lock calls compile to no-ops, so these
+ * wrappers remain usable (and equivalent to the plain API).
+ *
+ * For callers that need to batch several operations atomically, use
+ * mt_lock() / mt_unlock() manually around the plain API instead.
+ */
+
+/**
+ * mtree_lock_store_range - Locked version of mtree_store_range().
+ */
+static inline int mtree_lock_store_range(struct maple_tree *mt,
+                                         uint64_t first, uint64_t last,
+                                         void *entry)
+{
+    mt_lock(mt);
+    int ret = mtree_store_range(mt, first, last, entry);
+    mt_unlock(mt);
+    return ret;
+}
+
+/**
+ * mtree_lock_store - Locked version of mtree_store().
+ */
+static inline int mtree_lock_store(struct maple_tree *mt, uint64_t index,
+                                   void *entry)
+{
+    return mtree_lock_store_range(mt, index, index, entry);
+}
+
+/**
+ * mtree_lock_load - Locked version of mtree_load().
+ */
+static inline void *mtree_lock_load(struct maple_tree *mt, uint64_t index)
+{
+    mt_lock(mt);
+    void *entry = mtree_load(mt, index);
+    mt_unlock(mt);
+    return entry;
+}
+
+/**
+ * mtree_lock_erase - Locked version of mtree_erase().
+ */
+static inline void *mtree_lock_erase(struct maple_tree *mt, uint64_t index)
+{
+    mt_lock(mt);
+    void *entry = mtree_erase(mt, index);
+    mt_unlock(mt);
+    return entry;
+}
+
+/**
+ * mtree_lock_destroy - Locked version of mtree_destroy().
+ *
+ * Acquires the lock, destroys all nodes, then unlocks.
+ */
+static inline void mtree_lock_destroy(struct maple_tree *mt)
+{
+    mt_lock(mt);
+    mtree_destroy(mt);
+    mt_unlock(mt);
+}
+
+/* ====================================================================== */
 /*  Iteration macros                                                       */
 /* ====================================================================== */
 
