@@ -6,9 +6,10 @@
  * individual test.  Deferred-free objects accumulate in a global linked
  * list (mutex-protected) and are drained in a per-test teardown.
  *
- * All 99 test functions from test_maple_tree.c are pulled in via #include
- * and re-registered with the RCU teardown.  Two additional RCU-specific
- * tests exercise deferred-free accounting and lock-free reader concurrency.
+ * All test functions from test_maple_tree.c are pulled in via #include
+ * and re-registered with the RCU teardown. Additional RCU-specific tests
+ * exercise deferred-free accounting, lock-free reader concurrency, and
+ * deterministic allocator-failure paths.
  *
  * Build with: -DMT_CONFIG_RCU -DMT_CUSTOM_RCU
  */
@@ -22,7 +23,68 @@
 /* ====================================================================== */
 
 #include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
 #include <pthread.h>
+
+static pthread_mutex_t alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static int alloc_fail_after = -1;
+static size_t alloc_call_count;
+
+void *mt_alloc_fn(size_t size)
+{
+    bool fail = false;
+
+    pthread_mutex_lock(&alloc_lock);
+    alloc_call_count++;
+    if (alloc_fail_after == 0) {
+        fail = true;
+    } else if (alloc_fail_after > 0) {
+        alloc_fail_after--;
+    }
+    pthread_mutex_unlock(&alloc_lock);
+
+    if (fail)
+        return NULL;
+
+    size_t align = 256;
+    size_t alloc_size = (size + align - 1) & ~(align - 1);
+    void *ptr = aligned_alloc(align, alloc_size);
+    if (ptr)
+        memset(ptr, 0, alloc_size);
+    return ptr;
+}
+
+void mt_free_fn(void *ptr)
+{
+    free(ptr);
+}
+
+static void mt_test_alloc_reset(void)
+{
+    pthread_mutex_lock(&alloc_lock);
+    alloc_fail_after = -1;
+    alloc_call_count = 0;
+    pthread_mutex_unlock(&alloc_lock);
+}
+
+static void mt_test_alloc_fail_after_successes(int successes)
+{
+    pthread_mutex_lock(&alloc_lock);
+    alloc_fail_after = successes;
+    alloc_call_count = 0;
+    pthread_mutex_unlock(&alloc_lock);
+}
+
+static size_t mt_test_alloc_calls(void)
+{
+    size_t calls;
+
+    pthread_mutex_lock(&alloc_lock);
+    calls = alloc_call_count;
+    pthread_mutex_unlock(&alloc_lock);
+    return calls;
+}
 
 struct rcu_entry {
     struct rcu_entry   *next;
@@ -209,6 +271,110 @@ static void test_rcu_lockfree_readers(void **state) {
     mtree_destroy(&mt);
 }
 
+static void test_rcu_cursor_next_retries_dead_leaf(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    for (uint64_t i = 0; i < 20; i++)
+        assert_int_equal(0, mtree_lock_store(&mt, i, VAL(i + 1)));
+
+    mt_rcu_lock();
+    MA_STATE(mas, &mt, 4, 4);
+    assert_ptr_equal(VAL(5), mas_walk(&mas));
+    assert_true(mas.node != NULL);
+
+    assert_ptr_equal(VAL(5), mtree_lock_erase(&mt, 4));
+    assert_ptr_equal(VAL(6), mas_next(&mas, MAPLE_MAX));
+    mt_rcu_unlock();
+
+    mtree_destroy(&mt);
+}
+
+static void test_rcu_rebalance_merge_alloc_failure_leaves_tree_valid(void **state)
+{
+    (void)state;
+    struct maple_tree mt;
+    uint64_t trigger = MAPLE_MAX;
+
+    init_tree(&mt);
+
+    for (uint64_t i = 0; i < 100; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 1)));
+    for (uint64_t i = 0; i < 100; i++) {
+        mt_test_alloc_reset();
+        assert_ptr_equal(VAL(i + 1), mtree_erase(&mt, i));
+        if (mt_test_alloc_calls() >= 2) {
+            trigger = i;
+            break;
+        }
+    }
+    assert_true(trigger != MAPLE_MAX);
+    mt_test_alloc_reset();
+    mtree_destroy(&mt);
+
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 100; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 1)));
+    for (uint64_t i = 0; i < trigger; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_erase(&mt, i));
+
+    mt_test_alloc_fail_after_successes(1);
+    assert_ptr_equal(VAL(trigger + 1), mtree_erase(&mt, trigger));
+    assert_int_equal(2, (int)mt_test_alloc_calls());
+    mt_test_alloc_reset();
+
+    for (uint64_t i = 0; i <= trigger; i++)
+        assert_null(mtree_load(&mt, i));
+    for (uint64_t i = trigger + 1; i < 100; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+
+    mtree_destroy(&mt);
+}
+
+static void test_rcu_rebalance_parent_alloc_failure_leaves_tree_valid(void **state)
+{
+    (void)state;
+    struct maple_tree mt;
+    uint64_t trigger = MAPLE_MAX;
+
+    init_tree(&mt);
+
+    for (uint64_t i = 0; i < 100; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 1)));
+    for (uint64_t i = 0; i < 100; i++) {
+        mt_test_alloc_reset();
+        assert_ptr_equal(VAL(i + 1), mtree_erase(&mt, i));
+        if (mt_test_alloc_calls() >= 3) {
+            trigger = i;
+            break;
+        }
+    }
+    assert_true(trigger != MAPLE_MAX);
+    mt_test_alloc_reset();
+    mtree_destroy(&mt);
+
+    init_tree(&mt);
+    for (uint64_t i = 0; i < 100; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 1)));
+    for (uint64_t i = 0; i < trigger; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_erase(&mt, i));
+
+    mt_test_alloc_fail_after_successes(2);
+    assert_ptr_equal(VAL(trigger + 1), mtree_erase(&mt, trigger));
+    assert_int_equal(3, (int)mt_test_alloc_calls());
+    mt_test_alloc_reset();
+
+    for (uint64_t i = 0; i < 100; i++) {
+        if (i <= trigger)
+            assert_null(mtree_load(&mt, i));
+        else
+            assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+    }
+
+    mtree_destroy(&mt);
+}
+
 /* ====================================================================== */
 /*  Teardown: drain deferred frees after each test                         */
 /* ====================================================================== */
@@ -217,6 +383,7 @@ static int rcu_teardown(void **state)
 {
     (void)state;
     mt_rcu_drain();
+    mt_test_alloc_reset();
     return 0;
 }
 
@@ -235,6 +402,8 @@ int main(void) {
         T(test_store_range),
         T(test_overwrite),
         T(test_erase),
+        T(test_erase_last_entry_sets_empty),
+        T(test_erase_index_last_entry_sets_empty),
         T(test_erase_nonexistent),
         T(test_sequential_insert),
         T(test_reverse_insert),
@@ -281,6 +450,8 @@ int main(void) {
         T(test_mas_prev_full_scan),
         T(test_mas_next_bounded),
         T(test_mas_prev_bounded),
+        T(test_mas_next_bound_miss_invalidates_cursor),
+        T(test_mas_prev_bound_miss_invalidates_cursor),
         T(test_mt_find_bounded),
         T(test_mt_find_empty),
         T(test_mt_next_at_end),
@@ -312,6 +483,7 @@ int main(void) {
         T(test_rebalance_erase_all_sequential),
         T(test_rebalance_erase_reverse),
         T(test_rebalance_tree_shrink),
+        T(test_rebalance_internal_nodes_not_underfull),
         T(test_rebalance_redistribute),
         T(test_rebalance_interleaved_erase),
         T(test_rebalance_reinsert_after_shrink),
@@ -331,6 +503,9 @@ int main(void) {
         /* -- RCU-specific tests -- */
         T(test_rcu_deferred_accounting),
         T(test_rcu_lockfree_readers),
+        T(test_rcu_cursor_next_retries_dead_leaf),
+        T(test_rcu_rebalance_merge_alloc_failure_leaves_tree_valid),
+        T(test_rcu_rebalance_parent_alloc_failure_leaves_tree_valid),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

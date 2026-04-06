@@ -430,11 +430,18 @@ void  mtree_destroy(struct maple_tree *mt);
  * @defgroup cursor Cursor (ma_state) API
  * @{
  *
- * The cursor API uses a lightweight `struct ma_state` (typically
- * stack-allocated via the MA_STATE() macro) to track position within
- * the tree.  It avoids repeated root-to-leaf traversals when
- * performing sequential operations such as scanning, inserting a
- * batch of adjacent keys, or mixed read-modify-erase workflows.
+ * The cursor API uses a stack-allocated `struct ma_state` to track
+ * position within the tree.  The cursor now caches the full root-to-node
+ * path in a fixed-size in-structure array rather than keeping only the
+ * current node.  That makes sequential traversal much cheaper for
+ * kernel-style workloads because mas_next() / mas_prev() can ascend and
+ * descend using cached path frames instead of repeatedly reconstructing
+ * bounds from parent pointers.
+ *
+ * The tradeoff is intentional: the cursor is larger on the stack, but it
+ * avoids dynamic allocation and reduces per-step traversal overhead.
+ * See struct ma_state in maple_tree_type.h for detailed field semantics,
+ * especially the cached path frames and the meaning of depth.
  *
  * **Functions:**
  *   - MA_STATE()  — declare and initialise a cursor on the stack
@@ -485,8 +492,8 @@ void  mtree_destroy(struct maple_tree *mt);
  * @mas: Maple state cursor.  On entry, mas->index is the target index.
  *
  * Descends from the root to the leaf slot that covers mas->index.
- * On return, mas->node, mas->offset, mas->min, mas->max, and
- * mas->depth are updated to reflect the located position.
+ * On return, mas->node, mas->offset, mas->min, mas->max, mas->depth,
+ * and the cached path frames are updated to reflect the located position.
  *
  * Return: The entry at that position, or NULL if it is a gap.
  */
@@ -533,8 +540,9 @@ void *mas_find(struct ma_state *mas, uint64_t max);
  * @mas: Maple state cursor, already positioned (e.g. via mas_walk).
  * @max: Upper index bound (inclusive).
  *
- * Moves forward one slot at a time, ascending to parent/sibling nodes
- * as needed.  Updates mas->node, mas->offset, mas->min, and mas->max.
+ * Moves forward one slot at a time, ascending and descending through the
+ * cached path as needed.  Updates the current slot state plus the cached
+ * path frames.
  *
  * Return: The next non-NULL entry, or NULL if none exists up to @max.
  */
@@ -545,8 +553,8 @@ void *mas_next(struct ma_state *mas, uint64_t max);
  * @mas: Maple state cursor, already positioned.
  * @min: Lower index bound (inclusive).
  *
- * Moves backward one slot at a time, ascending to parent/sibling nodes
- * as needed.
+ * Moves backward one slot at a time, ascending and descending through the
+ * cached path as needed.
  *
  * Return: The previous non-NULL entry, or NULL if none exists down to @min.
  */

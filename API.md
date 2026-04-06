@@ -44,19 +44,21 @@ Always allocate on the stack or embed in your own struct; then call
 
 ### `struct ma_state` (Cursor)
 
-A lightweight cursor that tracks position within a tree traversal.  Always
+A stack-resident cursor that tracks position within a tree traversal and
+caches the full root-to-node walk for efficient sequential access. Always
 stack-allocate via the `MA_STATE()` macro.
 
-| Field    | Type                | Description                                 |
-|----------|---------------------|---------------------------------------------|
-| `tree`   | `struct maple_tree*` | The tree this cursor operates on.           |
-| `index`  | `uint64_t`          | Start of the search/store range.            |
-| `last`   | `uint64_t`          | End of the search/store range (inclusive).   |
-| `node`   | `struct maple_node*` | Current node (NULL before first walk).      |
-| `min`    | `uint64_t`          | Minimum index reachable through `node`.     |
-| `max`    | `uint64_t`          | Maximum index reachable through `node`.     |
-| `offset` | `uint8_t`           | Slot offset within `node`.                  |
-| `depth`  | `uint8_t`           | Current depth (0 = root).                   |
+| Field    | Type                 | Description                                                  |
+|----------|----------------------|--------------------------------------------------------------|
+| `tree`   | `struct maple_tree*` | The tree this cursor operates on.                            |
+| `index`  | `uint64_t`           | Start of the search/store range, or next retry position.     |
+| `last`   | `uint64_t`           | End of the search/store range (inclusive).                   |
+| `node`   | `struct maple_node*` | Current positioned node, usually the leaf owning `offset`.   |
+| `min`    | `uint64_t`           | Inclusive minimum index covered by the current slot.         |
+| `max`    | `uint64_t`           | Inclusive maximum index covered by the current slot.         |
+| `offset` | `uint8_t`            | Slot offset within `node`.                                   |
+| `depth`  | `uint8_t`            | Number of valid cached path frames in `path[]`.              |
+| `path`   | `struct maple_path_frame[32]` | Cached root-to-node path used by `mas_next()` / `mas_prev()`. |
 
 ### `MA_STATE(name, mt, first, end)`
 
@@ -70,8 +72,9 @@ MA_STATE(mas, &mt, 0, 0);   // cursor named 'mas', starting at index 0
 
 | Name               | Value             | Description                        |
 |--------------------|-------------------|------------------------------------|
-| `MAPLE_NODE_SLOTS` | 16                | Branching factor (slots per node). |
-| `MAPLE_NODE_PIVOTS`| 15                | Pivot keys per node.               |
+| `MAPLE_NODE_SLOTS` | 10                | Branching factor (slots per node). |
+| `MAPLE_NODE_PIVOTS`| 9                 | Pivot keys per node.               |
+| `MAPLE_CURSOR_MAX_DEPTH` | 32         | Maximum cached cursor depth.       |
 | `MAPLE_MIN`        | 0                 | Minimum index value.               |
 | `MAPLE_MAX`        | `~(uint64_t)0`   | Maximum index value.               |
 
@@ -227,11 +230,10 @@ mtree_destroy(&mt);
 
 ## 3. Cursor API
 
-The cursor API uses a lightweight `struct ma_state` (stack-allocated via
-`MA_STATE()`) to track position within the tree.  It avoids repeated
-root-to-leaf traversals when performing sequential operations such as
-scanning, batch inserts of adjacent keys, or mixed read-modify-erase
-workflows.
+The cursor API uses a stack-resident `struct ma_state` (via `MA_STATE()`) to
+track position within the tree. The cursor caches the exact root-to-node path,
+so sequential operations can move sideways and re-descend without rebuilding
+parent bounds from scratch on every step.
 
 ### Functions
 
@@ -239,8 +241,8 @@ workflows.
 
 Descend from the root to the leaf slot that covers `mas->index`.
 
-On return, `mas->node`, `mas->offset`, `mas->min`, `mas->max`, and
-`mas->depth` are updated.
+On return, `mas->node`, `mas->offset`, `mas->min`, `mas->max`, `mas->depth`,
+and the cached `mas->path[]` frames are updated.
 
 - **Returns:** The entry at that position, or `NULL` if it is a gap.
 
@@ -266,7 +268,9 @@ If the cursor has not yet been walked (`mas->node == NULL`), an implicit
 `mas_walk()` is performed first.
 
 On return, `mas->index` is advanced past the found entry (to
-`mas->max + 1`) so repeated calls iterate forward.
+`mas->max + 1`) so repeated calls iterate forward. If the next candidate falls
+outside the bound, the cursor is invalidated rather than left positioned on an
+out-of-range slot.
 
 - **Returns:** The next non-NULL entry, or `NULL` if no entry exists in
   `[mas->index, max]`.
@@ -275,17 +279,18 @@ On return, `mas->index` is advanced past the found entry (to
 
 Advance to the next non-NULL entry after the current position.
 
-The cursor must already be positioned (e.g. via `mas_walk()`).
+The cursor must already be positioned (e.g. via `mas_walk()`). The cached path
+is reused to ascend to a sibling subtree and descend back to the next entry.
 
 - **Returns:** The next non-NULL entry, or `NULL` if none exists up to
-  `max`.
+    `max`. On a bounded miss, the cursor is invalidated.
 
 #### `void *mas_prev(struct ma_state *mas, uint64_t min)`
 
 Move to the previous non-NULL entry before the current position.
 
 - **Returns:** The previous non-NULL entry, or `NULL` if none exists down
-  to `min`.
+    to `min`. On a bounded miss, the cursor is invalidated.
 
 ### Using Together
 

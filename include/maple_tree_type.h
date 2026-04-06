@@ -126,16 +126,65 @@ struct maple_tree {
 /* ----------------------------------------------------------------------- */
 
 /**
+ * Maximum cached cursor depth.
+ *
+ * The standalone maple tree uses a fixed-size path cache inside
+ * struct ma_state so forward/backward cursor movement can ascend and
+ * descend without re-deriving parent bounds from the live tree.
+ *
+ * With a 10-way branching factor, 32 cached levels cover more than
+ * 10^32 leaf positions, far beyond any tree that could exist in memory.
+ * Keeping the cache fixed-size avoids dynamic allocation in cursor code,
+ * which is important for kernel-style use.
+ */
+#define MAPLE_CURSOR_MAX_DEPTH  32
+
+/**
+ * struct maple_path_frame - One cached step in a cursor's root-to-node path.
+ *
+ * @node:     Node visited at this tree level.
+ * @node_min: Inclusive minimum index covered by @node as a whole.
+ * @node_max: Inclusive maximum index covered by @node as a whole.
+ * @slot:     Selected slot within @node.
+ *
+ * For internal nodes, @slot is the child branch chosen while descending.
+ * For leaf nodes, @slot is the current entry/gap slot that the cursor is
+ * positioned on.  Caching node-wide bounds rather than slot-local bounds
+ * allows the cursor to recompute slot min/max locally from pivots while
+ * moving laterally within the same node.
+ */
+struct maple_path_frame {
+    struct maple_node *node;
+    uint64_t node_min;
+    uint64_t node_max;
+    uint8_t  slot;
+    uint8_t  __pad[7];
+};
+
+/**
  * struct ma_state (MAS) - Walk / cursor state.
  *
  * @tree:   Pointer to the maple tree.
- * @index:  Start of the search/store range.
+ * @index:  Start of the search/store range, or the next retry position for
+ *          iteration helpers.
  * @last:   End of the search/store range (inclusive).
- * @node:   Current node (or NULL).
- * @min:    Minimum index reachable through @node.
- * @max:    Maximum index reachable through @node.
+ * @node:   Current positioned node, typically the leaf that owns @offset.
+ *          NULL means the cursor is not positioned on a node.
+ * @min:    Inclusive minimum index of the current slot.
+ * @max:    Inclusive maximum index of the current slot.
  * @offset: Slot offset within @node.
- * @depth:  Current depth (0 = root).
+ * @depth:  Number of valid frames currently cached in @path when @node is
+ *          non-NULL.  A value of 0 means there is no cached path.
+ *          UINT8_MAX is reserved internally as an RCU retry sentinel.
+ * @path:   Cached root-to-node walk.  path[0] is the root frame and
+ *          path[depth - 1] is the current node frame.
+ *
+ * The extended cursor caches the exact walk from the root to the current
+ * node.  That gives sequential operations kernel-friendly behavior:
+ * mas_next() / mas_prev() can ascend by walking cached frames rather than
+ * recovering parent pointers and subtree bounds from the live tree each
+ * time.  The cache is rebuilt by mas_walk() and invalidated whenever the
+ * cursor becomes unpositioned or an RCU retry is required.
  */
 struct ma_state {
     struct maple_tree *tree;
@@ -146,6 +195,7 @@ struct ma_state {
     uint64_t max;
     uint8_t  offset;
     uint8_t  depth;
+    struct maple_path_frame path[MAPLE_CURSOR_MAX_DEPTH];
 };
 
 /** Stack initialiser for an ma_state. */

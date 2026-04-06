@@ -17,7 +17,53 @@
 
 #define VAL(n) ((void *)(uintptr_t)(n))
 
+#define TEST_MAPLE_NODE_MIN  (MAPLE_NODE_SLOTS / 4)
+
 static void init_tree(struct maple_tree *mt) { mt_init(mt); }
+
+static bool test_root_is_node(const struct maple_tree *mt)
+{
+    return (((uintptr_t)mt->ma_root) & MAPLE_ROOT_NODE) != 0;
+}
+
+static struct maple_node *test_root_to_node(const struct maple_tree *mt)
+{
+    return (struct maple_node *)(((uintptr_t)mt->ma_root) & ~MAPLE_ROOT_NODE);
+}
+
+static bool test_node_is_leaf(const struct maple_node *node)
+{
+    return ((node->parent & MAPLE_PARENT_TYPE_MASK) >> MAPLE_PARENT_TYPE_SHIFT)
+        == maple_leaf_64;
+}
+
+static bool test_tree_has_underfull_internal(const struct maple_node *node,
+                                             bool is_root)
+{
+    if (node == NULL)
+        return false;
+
+    if (!test_node_is_leaf(node)) {
+        if (!is_root && node->slot_len < TEST_MAPLE_NODE_MIN)
+            return true;
+
+        for (uint8_t i = 0; i < node->slot_len; i++) {
+            if (test_tree_has_underfull_internal(
+                    (const struct maple_node *)node->slot[i], false))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+static void assert_no_underfull_internal_nodes(struct maple_tree *mt)
+{
+    if (!test_root_is_node(mt))
+        return;
+
+    assert_false(test_tree_has_underfull_internal(test_root_to_node(mt), true));
+}
 
 /* -- Basic tests ------------------------------------------------------- */
 
@@ -82,6 +128,29 @@ static void test_erase(void **state) {
     mtree_store(&mt, 5, VAL(1));
     void *old = mtree_erase(&mt, 5);
     assert_ptr_equal(VAL(1), old);
+    assert_null(mtree_load(&mt, 5));
+    mtree_destroy(&mt);
+}
+
+static void test_erase_last_entry_sets_empty(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    mtree_store(&mt, 5, VAL(1));
+    assert_false(mt_empty(&mt));
+    assert_ptr_equal(VAL(1), mtree_erase(&mt, 5));
+    assert_true(mt_empty(&mt));
+    assert_null(mtree_load(&mt, 5));
+    mtree_destroy(&mt);
+}
+
+static void test_erase_index_last_entry_sets_empty(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+    mtree_store(&mt, 5, VAL(1));
+    assert_ptr_equal(VAL(1), mtree_erase_index(&mt, 5));
+    assert_true(mt_empty(&mt));
     assert_null(mtree_load(&mt, 5));
     mtree_destroy(&mt);
 }
@@ -788,6 +857,44 @@ static void test_mas_prev_bounded(void **state) {
     mtree_destroy(&mt);
 }
 
+static void test_mas_next_bound_miss_invalidates_cursor(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    assert_int_equal(0, mtree_store(&mt, 0, VAL(1)));
+    assert_int_equal(0, mtree_store(&mt, 10, VAL(2)));
+
+    MA_STATE(mas, &mt, 0, 0);
+    assert_ptr_equal(VAL(1), mas_walk(&mas));
+    assert_non_null(mas.node);
+
+    assert_null(mas_next(&mas, 5));
+    assert_null(mas.node);
+    assert_int_equal(0, mas.depth);
+
+    mtree_destroy(&mt);
+}
+
+static void test_mas_prev_bound_miss_invalidates_cursor(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    assert_int_equal(0, mtree_store(&mt, 0, VAL(1)));
+    assert_int_equal(0, mtree_store(&mt, 10, VAL(2)));
+
+    MA_STATE(mas, &mt, 10, 10);
+    assert_ptr_equal(VAL(2), mas_walk(&mas));
+    assert_non_null(mas.node);
+
+    assert_null(mas_prev(&mas, 5));
+    assert_null(mas.node);
+    assert_int_equal(0, mas.depth);
+
+    mtree_destroy(&mt);
+}
+
 /* ================================================================== */
 /*  mt_find / mt_next / mt_prev edge cases                             */
 /* ================================================================== */
@@ -1358,6 +1465,27 @@ static void test_rebalance_tree_shrink(void **state) {
         assert_int_equal(0, mtree_store(&mt, i, VAL(i + 500)));
     for (uint64_t i = 0; i < 10; i++)
         assert_ptr_equal(VAL(i + 500), mtree_load(&mt, i));
+    mtree_destroy(&mt);
+}
+
+static void test_rebalance_internal_nodes_not_underfull(void **state) {
+    (void)state;
+    struct maple_tree mt;
+    init_tree(&mt);
+
+    for (uint64_t i = 0; i < 200; i++)
+        assert_int_equal(0, mtree_store(&mt, i, VAL(i + 1)));
+
+    assert_no_underfull_internal_nodes(&mt);
+
+    for (uint64_t i = 0; i < 145; i++) {
+        assert_ptr_equal(VAL(i + 1), mtree_erase(&mt, i));
+        assert_no_underfull_internal_nodes(&mt);
+    }
+
+    for (uint64_t i = 145; i < 200; i++)
+        assert_ptr_equal(VAL(i + 1), mtree_load(&mt, i));
+
     mtree_destroy(&mt);
 }
 
@@ -1984,6 +2112,8 @@ int main(void) {
         cmocka_unit_test(test_store_range),
         cmocka_unit_test(test_overwrite),
         cmocka_unit_test(test_erase),
+        cmocka_unit_test(test_erase_last_entry_sets_empty),
+        cmocka_unit_test(test_erase_index_last_entry_sets_empty),
         cmocka_unit_test(test_erase_nonexistent),
         cmocka_unit_test(test_sequential_insert),
         cmocka_unit_test(test_reverse_insert),
@@ -2035,6 +2165,8 @@ int main(void) {
         cmocka_unit_test(test_mas_prev_full_scan),
         cmocka_unit_test(test_mas_next_bounded),
         cmocka_unit_test(test_mas_prev_bounded),
+        cmocka_unit_test(test_mas_next_bound_miss_invalidates_cursor),
+        cmocka_unit_test(test_mas_prev_bound_miss_invalidates_cursor),
         /* mt_find / mt_next / mt_prev edge cases */
         cmocka_unit_test(test_mt_find_bounded),
         cmocka_unit_test(test_mt_find_empty),
@@ -2074,6 +2206,7 @@ int main(void) {
         cmocka_unit_test(test_rebalance_erase_all_sequential),
         cmocka_unit_test(test_rebalance_erase_reverse),
         cmocka_unit_test(test_rebalance_tree_shrink),
+        cmocka_unit_test(test_rebalance_internal_nodes_not_underfull),
         cmocka_unit_test(test_rebalance_redistribute),
         cmocka_unit_test(test_rebalance_interleaved_erase),
         cmocka_unit_test(test_rebalance_reinsert_after_shrink),

@@ -6,12 +6,12 @@ A standalone, portable C implementation of the Linux kernel maple tree data stru
 
 ## Features
 
-- **16-slot B-tree nodes** with 15 pivots — compact and cache-friendly
+- **10-slot B-tree nodes** with 9 pivots — compact and cache-friendly
 - **Range storage**: `[first, last] → void*` with automatic coalescing
 - **Gap tracking**: O(log n) search for free ranges (used by VM subsystems)
 - **Optional RCU-safe reads**: pluggable read-side protection
 - **Optional locking**: pluggable write-side serialization
-- **Cursor API** (`ma_state`): efficient sequential access and iteration
+- **Cursor API** (`ma_state`): cached-path sequential access and iteration
 - **Zero external dependencies** beyond libc (and cmocka for tests)
 
 > Full API reference: [API.md](API.md) | [API.zh-CN.md](API.zh-CN.md)
@@ -28,7 +28,7 @@ make
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `MT_ENABLE_LOCK` | OFF | Enable pthread-based spin lock in `maple_tree` |
+| `MT_ENABLE_LOCK` | ON  | Enable pthread mutex-based locking in `maple_tree` |
 | `MT_ENABLE_RCU`  | OFF | Enable RCU stub functions |
 | `MT_BUILD_TESTS` | ON  | Build test executable |
 | `ENABLE_ASAN`    | ON  | Enable AddressSanitizer |
@@ -102,7 +102,8 @@ mt_init(&mt);
 mtree_store(&mt, index, entry);
 mtree_store_range(&mt, first, last, entry);
 void *e = mtree_load(&mt, index);
-void *old = mtree_erase(&mt, index);
+void *old = mtree_erase(&mt, index);           // erase the whole covering range
+void *old2 = mtree_erase_index(&mt, index);    // erase only one index
 mtree_destroy(&mt);
 ```
 
@@ -116,6 +117,11 @@ mas_find(&mas, max);
 mas_next(&mas, max);
 mas_prev(&mas, min);
 ```
+
+`ma_state` caches the root-to-node walk in a fixed-size path buffer, so
+`mas_next()` / `mas_prev()` can move across neighbouring subtrees without a
+full re-walk on every step. Bounded cursor operations invalidate the cursor on
+an out-of-range miss rather than leaving it positioned on a stale slot.
 
 ### Gap Search
 ```c

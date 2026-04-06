@@ -47,7 +47,7 @@ if(MT_BUILD_TESTS)
     add_library(maple_tree_rcu src/maple_tree.c)
     target_include_directories(maple_tree_rcu PUBLIC include)
     target_compile_options(maple_tree_rcu PRIVATE -Wall -Wextra -Werror)
-    target_compile_definitions(maple_tree_rcu PUBLIC MT_CONFIG_RCU MT_CUSTOM_RCU)
+    target_compile_definitions(maple_tree_rcu PUBLIC MT_CONFIG_RCU MT_CUSTOM_RCU MT_CUSTOM_ALLOC)
     if(MT_ENABLE_LOCK)
         target_compile_definitions(maple_tree_rcu PUBLIC MT_CONFIG_LOCK)
         target_link_libraries(maple_tree_rcu PUBLIC pthread)
@@ -59,6 +59,7 @@ if(MT_BUILD_TESTS)
     endif()
 
     add_executable(test_maple_tree_rcu test/test_maple_tree_rcu.c)
+    target_compile_definitions(test_maple_tree_rcu PRIVATE MT_CUSTOM_ALLOC)
     target_link_libraries(test_maple_tree_rcu maple_tree_rcu ${CMOCKA} pthread)
     if(ENABLE_ASAN)
         target_compile_options(test_maple_tree_rcu PRIVATE
@@ -66,7 +67,37 @@ if(MT_BUILD_TESTS)
         target_link_options(test_maple_tree_rcu PRIVATE -fsanitize=address)
     endif()
 
+    add_library(maple_tree_rcu_rebal_guard src/maple_tree.c)
+    target_include_directories(maple_tree_rcu_rebal_guard PUBLIC include)
+    target_compile_options(maple_tree_rcu_rebal_guard PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(maple_tree_rcu_rebal_guard PUBLIC
+        MT_CONFIG_RCU
+        MT_REBAL_MAX_DEAD=1
+        MT_REBAL_MAX_UNPUB=1)
+    if(MT_ENABLE_LOCK)
+        target_compile_definitions(maple_tree_rcu_rebal_guard PUBLIC MT_CONFIG_LOCK)
+        target_link_libraries(maple_tree_rcu_rebal_guard PUBLIC pthread)
+    endif()
+    if(ENABLE_ASAN)
+        target_compile_options(maple_tree_rcu_rebal_guard PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(maple_tree_rcu_rebal_guard PRIVATE -fsanitize=address)
+    endif()
+
+    add_executable(test_maple_tree_rcu_rebal_guard
+        test/test_maple_tree_rcu_rebal_guard.c)
+    target_link_libraries(test_maple_tree_rcu_rebal_guard
+        maple_tree_rcu_rebal_guard ${CMOCKA} pthread)
+    if(ENABLE_ASAN)
+        target_compile_options(test_maple_tree_rcu_rebal_guard PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(test_maple_tree_rcu_rebal_guard PRIVATE
+            -fsanitize=address)
+    endif()
+
     enable_testing()
     add_test(NAME maple_tree_tests COMMAND test_maple_tree)
     add_test(NAME maple_tree_rcu_tests COMMAND test_maple_tree_rcu)
+    add_test(NAME maple_tree_rcu_rebal_guard_tests
+        COMMAND test_maple_tree_rcu_rebal_guard)
 endif()
