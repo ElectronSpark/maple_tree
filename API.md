@@ -638,6 +638,12 @@ mas_for_each(&mas, entry, 999) {
 }
 // After break, mas.index / mas.last still reflect the last entry.
 
+// --- Resume iteration after break ---
+// The cursor retains its position, so the next loop continues from there.
+mas_for_each(&mas, entry, 999) {
+    process_remaining(entry);
+}
+
 // --- Count entries ---
 int count = 0;
 idx = 0;
@@ -653,6 +659,92 @@ mt_for_each(&mt, entry, idx, UINT64_MAX) {
     if (n < 100)
         entries[n++] = entry;
 }
+
+// --- Filter by predicate ---
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    struct vma *vma = entry;
+    if (vma->flags & VM_WRITE)
+        printf("writable region: %p\n", vma);
+}
+
+// --- Find first entry matching a condition ---
+void *found = NULL;
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    if (matches(entry)) {
+        found = entry;
+        break;
+    }
+}
+
+// --- Delete during iteration (must use mas_for_each) ---
+// mt_for_each cannot safely delete because it has no cursor.
+// Use mas_for_each with mas_erase() instead:
+MA_STATE(mas, &mt, 0, 0);
+mas_for_each(&mas, entry, UINT64_MAX) {
+    if (should_remove(entry))
+        mas_erase(&mas);          // safe: cursor advances correctly
+}
+
+// --- Replace entries during iteration ---
+MA_STATE(mas, &mt, 0, 0);
+mas_for_each(&mas, entry, UINT64_MAX) {
+    if (needs_update(entry)) {
+        void *new_entry = transform(entry);
+        mas_store(&mas, new_entry);
+    }
+}
+
+// --- Aggregate: compute total size ---
+uint64_t total_size = 0;
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    struct region *r = entry;
+    total_size += r->size;
+}
+
+// --- Paginated traversal: process at most N entries at a time ---
+#define PAGE_SIZE 64
+uint64_t cursor = 0;
+int processed;
+do {
+    processed = 0;
+    mt_for_each(&mt, entry, cursor, UINT64_MAX) {
+        process(entry);
+        if (++processed >= PAGE_SIZE)
+            break;                // cursor has advanced; next round resumes here
+    }
+} while (processed == PAGE_SIZE);
+
+// --- Find the last entry in a range ---
+void *last_entry = NULL;
+idx = 0;
+mt_for_each(&mt, entry, idx, 1000) {
+    last_entry = entry;           // keep overwriting; final value is the last
+}
+
+// --- Intersection of two trees: indices with entries in both ---
+uint64_t i = 0;
+mt_for_each(&mt_a, entry, i, UINT64_MAX) {
+    // mt_for_each advances i past the entry; step back to the entry start
+    void *other = mtree_load(&mt_b, i - 1);
+    if (other != NULL)
+        handle_overlap(entry, other);
+}
+
+// --- Batched operations with mas_for_each ---
+MA_STATE(mas, &mt, 0, 0);
+int batch = 0;
+mas_for_each(&mas, entry, UINT64_MAX) {
+    enqueue(entry);
+    if (++batch == 32) {
+        flush_batch();            // flush every 32 entries
+        batch = 0;
+    }
+}
+if (batch > 0)
+    flush_batch();                // handle remaining entries
 ```
 
 ---

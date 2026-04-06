@@ -123,6 +123,26 @@ static inline bool mt_empty(const struct maple_tree *mt)
     return READ_ONCE(mt->ma_root) == NULL;
 }
 
+/**
+ * mt_set_in_rcu - Enable RCU copy-on-write mode for this tree.
+ * @mt: Pointer to the maple tree.
+ *
+ * Only effective when compiled with MT_CONFIG_RCU.
+ */
+static inline void mt_set_in_rcu(struct maple_tree *mt)
+{
+    mt->ma_flags |= MT_FLAGS_USE_RCU;
+}
+
+/**
+ * mt_clear_in_rcu - Disable RCU copy-on-write mode for this tree.
+ * @mt: Pointer to the maple tree.
+ */
+static inline void mt_clear_in_rcu(struct maple_tree *mt)
+{
+    mt->ma_flags &= ~MT_FLAGS_USE_RCU;
+}
+
 /* ====================================================================== */
 /*  Locking helpers                                                        */
 /* ====================================================================== */

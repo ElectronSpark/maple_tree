@@ -40,6 +40,33 @@ if(MT_BUILD_TESTS)
         target_link_options(maple_tree PRIVATE -fsanitize=address)
     endif()
 
+    # ── RCU test ──────────────────────────────────────────────────────────
+    # A second library build with MT_CONFIG_RCU + MT_CUSTOM_RCU enabled,
+    # linked against the RCU test file that supplies the primitive RCU
+    # implementation (deferred-free with thread-local lists).
+    add_library(maple_tree_rcu src/maple_tree.c)
+    target_include_directories(maple_tree_rcu PUBLIC include)
+    target_compile_options(maple_tree_rcu PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(maple_tree_rcu PUBLIC MT_CONFIG_RCU MT_CUSTOM_RCU)
+    if(MT_ENABLE_LOCK)
+        target_compile_definitions(maple_tree_rcu PUBLIC MT_CONFIG_LOCK)
+        target_link_libraries(maple_tree_rcu PUBLIC pthread)
+    endif()
+    if(ENABLE_ASAN)
+        target_compile_options(maple_tree_rcu PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(maple_tree_rcu PRIVATE -fsanitize=address)
+    endif()
+
+    add_executable(test_maple_tree_rcu test/test_maple_tree_rcu.c)
+    target_link_libraries(test_maple_tree_rcu maple_tree_rcu ${CMOCKA} pthread)
+    if(ENABLE_ASAN)
+        target_compile_options(test_maple_tree_rcu PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        target_link_options(test_maple_tree_rcu PRIVATE -fsanitize=address)
+    endif()
+
     enable_testing()
     add_test(NAME maple_tree_tests COMMAND test_maple_tree)
+    add_test(NAME maple_tree_rcu_tests COMMAND test_maple_tree_rcu)
 endif()

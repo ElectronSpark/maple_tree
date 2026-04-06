@@ -39,8 +39,7 @@ static struct maple_node *mt_alloc_node(void)
     struct maple_node *node = mt_alloc_fn(sizeof(struct maple_node));
     if (node == NULL)
         return NULL;
-    /* mt_alloc_fn returns zeroed memory, but ensure key fields. */
-    node->type = maple_leaf_64;
+    /* mt_alloc_fn returns zeroed memory; type defaults to maple_leaf_64 (0). */
     node->slot_len = 0;
     node->parent = 0;
     return node;
@@ -89,22 +88,23 @@ static inline void *mt_mk_root(struct maple_node *node)
 }
 
 /* ====================================================================== */
-/*  Parent-pointer encoding                                                */
+/*  Parent-pointer encoding (Linux-style, bits packed in low 8 bits)       */
 /* ====================================================================== */
-
-#define MAPLE_PARENT_ROOT   0x01UL
 
 static inline void mn_set_parent(struct maple_node *node,
                                  struct maple_node *parent, uint8_t slot)
 {
-    node->parent = (uint64_t)(uintptr_t)parent;
-    node->parent_slot = slot;
+    uint8_t type = (node->parent >> MAPLE_PARENT_TYPE_SHIFT) & 0x3;
+    node->parent = ((uint64_t)(uintptr_t)parent & ~(uint64_t)MAPLE_NODE_MASK)
+                 | ((uint64_t)slot << MAPLE_PARENT_SLOT_SHIFT)
+                 | ((uint64_t)type << MAPLE_PARENT_TYPE_SHIFT);
 }
 
 static inline void mn_set_root(struct maple_node *node)
 {
-    node->parent = MAPLE_PARENT_ROOT;
-    node->parent_slot = 0;
+    uint8_t type = (node->parent >> MAPLE_PARENT_TYPE_SHIFT) & 0x3;
+    node->parent = MAPLE_PARENT_ROOT
+                 | ((uint64_t)type << MAPLE_PARENT_TYPE_SHIFT);
 }
 
 static inline bool mn_is_root(const struct maple_node *node)
@@ -114,17 +114,235 @@ static inline bool mn_is_root(const struct maple_node *node)
 
 static inline struct maple_node *mn_get_parent(const struct maple_node *node)
 {
-    return (struct maple_node *)(uintptr_t)(node->parent & ~(uint64_t)0x1);
+    return (struct maple_node *)(uintptr_t)(node->parent & ~(uint64_t)MAPLE_NODE_MASK);
 }
 
 static inline uint8_t mn_get_parent_slot(const struct maple_node *node)
 {
-    return node->parent_slot;
+    return (node->parent & MAPLE_PARENT_SLOT_MASK) >> MAPLE_PARENT_SLOT_SHIFT;
+}
+
+static inline void mn_set_type(struct maple_node *node, enum maple_type type)
+{
+    node->parent = (node->parent & ~(uint64_t)MAPLE_PARENT_TYPE_MASK)
+                 | ((uint64_t)type << MAPLE_PARENT_TYPE_SHIFT);
+}
+
+static inline enum maple_type mn_get_type(const struct maple_node *node)
+{
+    return (enum maple_type)((node->parent & MAPLE_PARENT_TYPE_MASK)
+                              >> MAPLE_PARENT_TYPE_SHIFT);
 }
 
 static inline bool mn_is_leaf(const struct maple_node *node)
 {
-    return node->type == maple_leaf_64;
+    return mn_get_type(node) == maple_leaf_64;
+}
+
+/* ====================================================================== */
+/*  RCU mode & dead-node helpers                                           */
+/* ====================================================================== */
+
+/**
+ * mt_in_rcu - Check whether the tree is operating in RCU mode.
+ *
+ * When true, structural modifications (pivot/slot_len changes) must
+ * copy-on-write: allocate a new node, modify the copy, publish it,
+ * mark the old node dead, and defer freeing via RCU.
+ *
+ * Returns true only when the library is compiled with MT_CONFIG_RCU
+ * *and* the tree's MT_FLAGS_USE_RCU flag is set.
+ */
+static inline bool mt_in_rcu(const struct maple_tree *mt)
+{
+#ifdef MT_CONFIG_RCU
+    return (mt->ma_flags & MT_FLAGS_USE_RCU) != 0;
+#else
+    (void)mt;
+    return false;
+#endif
+}
+
+/**
+ * mn_is_dead - Check whether a node has been replaced and is awaiting
+ * RCU-deferred freeing.  Readers that land on a dead node must retry.
+ *
+ * A dead node is marked by setting parent to point to itself.
+ */
+static inline bool mn_is_dead(const struct maple_node *node)
+{
+    mt_smp_rmb();
+    return (uintptr_t)(node->parent & ~(uint64_t)MAPLE_NODE_MASK)
+        == (uintptr_t)node;
+}
+
+/**
+ * mn_mark_dead - Mark a node as dead (replaced).
+ *
+ * Sets the parent pointer to the node itself (preserving low-bit encoding
+ * is unnecessary since no one will read metadata from a dead node).
+ */
+static inline void mn_mark_dead(struct maple_node *node)
+{
+    node->parent = (uint64_t)(uintptr_t)node;
+}
+
+/**
+ * mn_copy_node - Allocate a new node that is a shallow copy of @src.
+ *
+ * Copies all fields (parent, slot_len, pivots, slots, gaps).
+ * The caller must fix up parent pointers on children and the parent link
+ * in the new node before publishing it.
+ */
+static inline struct maple_node *mn_copy_node(const struct maple_node *src)
+{
+    struct maple_node *dst = mt_alloc_node();
+    if (dst == NULL)
+        return NULL;
+    memcpy(dst, src, sizeof(struct maple_node));
+    return dst;
+}
+
+/**
+ * mn_replace_node - Replace @old with @new in @old's parent.
+ *
+ * Publishes @new via rcu_assign_pointer into the parent slot,
+ * marks @old dead, and defers freeing.  If @old is the tree root,
+ * updates mt->ma_root instead.
+ *
+ * Callers must have already set up @new's parent encoding (mn_set_parent
+ * or mn_set_root) and re-parented @new's children.
+ */
+static inline void mn_replace_node(struct maple_tree *mt,
+                                    struct maple_node *old,
+                                    struct maple_node *new_node)
+{
+    if (mn_is_root(old)) {
+        mn_set_root(new_node);
+        mt_rcu_assign_pointer(&mt->ma_root, mt_mk_root(new_node));
+    } else {
+        struct maple_node *parent = mn_get_parent(old);
+        uint8_t pslot = mn_get_parent_slot(old);
+        mn_set_parent(new_node, parent, pslot);
+        mt_rcu_assign_pointer(&parent->slot[pslot], new_node);
+    }
+    mn_mark_dead(old);
+    mt_free_node_rcu(old);
+}
+
+/* ====================================================================== */
+/*  Parent-child relationship helpers                                      */
+/* ====================================================================== */
+
+/**
+ * mn_reparent_children - Fix up parent_slot encoding for children[from..to).
+ *
+ * Call after shifting or copying child pointers so each child's encoded
+ * parent_slot matches its actual position in @parent.
+ */
+static inline void mn_reparent_children(struct maple_node *parent,
+                                     uint8_t from, uint8_t to)
+{
+    for (uint8_t i = from; i < to; i++) {
+        struct maple_node *child = parent->slot[i];
+        if (child != NULL)
+            mn_set_parent(child, parent, i);
+    }
+}
+
+/**
+ * mn_link_child - Establish a parent-child relationship.
+ *
+ * Sets @parent->slot[@slot] to @child and encodes the back-pointer in
+ * @child so that mn_get_parent() / mn_get_parent_slot() work correctly.
+ */
+static inline void mn_link_child(struct maple_node *parent, uint8_t slot,
+                                  struct maple_node *child)
+{
+    mt_rcu_assign_pointer(&parent->slot[slot], child);
+    mn_set_parent(child, parent, slot);
+}
+
+/**
+ * mn_truncate - Set @node's slot_len and clear trailing slots/gaps.
+ *
+ * Clears slot[new_len..MAPLE_NODE_SLOTS-1] to NULL and gap[] to 0.
+ */
+static inline void mn_truncate(struct maple_node *node, uint8_t new_len)
+{
+    node->slot_len = new_len;
+    for (uint8_t i = new_len; i < MAPLE_NODE_SLOTS; i++) {
+        node->slot[i] = NULL;
+        node->gap[i] = 0;
+    }
+}
+
+/**
+ * mn_copy_entries - Copy @count entries from @src to @dst.
+ *
+ * Copies slot, pivot (for all but the last entry), and optionally gap.
+ */
+static inline void mn_copy_entries(struct maple_node *dst, uint8_t dst_off,
+                                    const struct maple_node *src,
+                                    uint8_t src_off, uint8_t count,
+                                    bool copy_gaps)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        dst->slot[dst_off + i] = src->slot[src_off + i];
+        if (i < count - 1 && (dst_off + i) < MAPLE_NODE_PIVOTS)
+            dst->pivot[dst_off + i] = src->pivot[src_off + i];
+        if (copy_gaps)
+            dst->gap[dst_off + i] = src->gap[src_off + i];
+    }
+}
+
+/**
+ * mn_write_slots - Write @count slot/pivot pairs from arrays into @node.
+ *
+ * @pos:      Starting slot index in @node.
+ * @node_len: Total slot_len of the node (for pivot-boundary guard).
+ */
+static inline void mn_write_slots(struct maple_node *node, uint8_t pos,
+                                   void *slots[], uint64_t pivots[],
+                                   uint8_t count, uint8_t node_len)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        node->slot[pos + i] = slots[i];
+        if ((pos + i) < node_len - 1)
+            node->pivot[pos + i] = pivots[i];
+    }
+}
+
+/**
+ * mn_shift_down - Remove slot @pos by shifting later entries down.
+ *
+ * Shifts slots, pivots, and gaps (for internal nodes) down by one.
+ * Decrements slot_len and clears the trailing slot.
+ */
+static inline void mn_shift_down(struct maple_node *node, uint8_t pos)
+{
+    bool shift_gaps = !mn_is_leaf(node);
+    for (uint8_t i = pos; i + 1 < node->slot_len; i++) {
+        node->slot[i] = node->slot[i + 1];
+        if (i < MAPLE_NODE_PIVOTS && i + 1 < node->slot_len - 1)
+            node->pivot[i] = node->pivot[i + 1];
+        if (shift_gaps)
+            node->gap[i] = node->gap[i + 1];
+    }
+    node->slot_len--;
+    node->slot[node->slot_len] = NULL;
+}
+
+/**
+ * mn_remove_child - Remove slot @pos from @node, shifting later entries down.
+ *
+ * Handles slots, pivots, gaps (for internal nodes), slot_len decrement,
+ * trailing slot clear, and re-parenting of shifted children.
+ */
+static inline void mn_remove_child(struct maple_node *node, uint8_t pos)
+{
+    mn_shift_down(node, pos);
+    mn_reparent_children(node, pos, node->slot_len);
 }
 
 /* ====================================================================== */
@@ -151,10 +369,76 @@ static inline uint64_t mn_slot_min(const struct maple_node *node, uint8_t i,
 /*  Pivot binary search                                                    */
 /* ====================================================================== */
 
-static inline uint8_t mn_find_slot(const struct maple_node *node,
-                                    uint64_t index, uint8_t len)
+/**
+ * mas_set_slot - Position the cursor on @node at @slot.
+ *
+ * Sets node, offset, min, and max in a single call.
+ * Callers that also need mas->index updated should do so afterwards.
+ */
+static inline void mas_set_slot(struct ma_state *mas,
+                                struct maple_node *node, uint8_t slot,
+                                uint64_t node_min, uint64_t node_max)
 {
-    uint8_t lo = 0;
+    mas->node   = node;
+    mas->offset = slot;
+    mas->min    = mn_slot_min(node, slot, node_min);
+    mas->max    = mn_pivot(node, slot, node_max);
+}
+
+/**
+ * mas_set_pos - Position the cursor with pre-computed bounds.
+ *
+ * Like mas_set_slot(), but uses caller-supplied min/max directly
+ * instead of deriving them from pivots.  Also sets index = min.
+ */
+static inline void mas_set_pos(struct ma_state *mas,
+                               struct maple_node *node, uint8_t slot,
+                               uint64_t min, uint64_t max)
+{
+    mas->node   = node;
+    mas->offset = slot;
+    mas->min    = min;
+    mas->max    = max;
+    mas->index  = min;
+}
+
+/**
+ * mas_invalidate - Mark the cursor as unpositioned.
+ */
+static inline void mas_invalidate(struct ma_state *mas)
+{
+    mas->node = NULL;
+}
+
+/**
+ * mas_advance_index - Move index past the current entry.
+ *
+ * Sets mas->index to mas->max + 1, clamped at MAPLE_MAX.
+ */
+static inline void mas_advance_index(struct ma_state *mas)
+{
+    mas->index = (mas->max == MAPLE_MAX) ? MAPLE_MAX : mas->max + 1;
+}
+
+/**
+ * mas_set_gap - Record a found gap of @size starting at @start.
+ */
+static inline void mas_set_gap(struct ma_state *mas, uint64_t start,
+                               uint64_t size)
+{
+    mas->index = start;
+    mas->last  = start + size - 1;
+}
+
+/**
+ * __mn_bsearch - Binary-search the pivot array for the slot covering @index.
+ *
+ * Returns the smallest slot in [lo, len-1] whose pivot >= @index.
+ * The caller must ensure len > 0.
+ */
+static inline uint8_t __mn_bsearch(const struct maple_node *node,
+                                    uint64_t index, uint8_t lo, uint8_t len)
+{
     uint8_t hi = len - 1;
     while (lo < hi) {
         uint8_t mid = (lo + hi) >> 1;
@@ -167,21 +451,17 @@ static inline uint8_t mn_find_slot(const struct maple_node *node,
     return lo;
 }
 
+static inline uint8_t mn_find_slot(const struct maple_node *node,
+                                    uint64_t index, uint8_t len)
+{
+    return __mn_bsearch(node, index, 0, len);
+}
+
 static inline uint8_t mn_find_slot_from(const struct maple_node *node,
                                          uint64_t index, uint8_t from,
                                          uint8_t len)
 {
-    uint8_t lo = from;
-    uint8_t hi = len - 1;
-    while (lo < hi) {
-        uint8_t mid = (lo + hi) >> 1;
-        uint64_t piv = READ_ONCE(node->pivot[mid]);
-        if (index <= piv)
-            hi = mid;
-        else
-            lo = mid + 1;
-    }
-    return lo;
+    return __mn_bsearch(node, index, from, len);
 }
 
 /* ====================================================================== */
@@ -220,6 +500,16 @@ static void *__mt_lookup(struct maple_tree *mt, uint64_t index)
     }
 }
 
+/**
+ * mtree_load - Look up the entry at @index.
+ *
+ * RCU sequence (read-only — no structural changes):
+ *  1. mt_rcu_lock()   — enter RCU read-side critical section.
+ *  2. Walk top-down via mt_rcu_dereference() at each level.
+ *  3. mt_rcu_unlock() — leave critical section.
+ *
+ * Write-side locking: none required.
+ */
 void *mtree_load(struct maple_tree *mt, uint64_t index)
 {
     void *entry;
@@ -233,6 +523,15 @@ void *mtree_load(struct maple_tree *mt, uint64_t index)
 /*  MAS walk                                                               */
 /* ====================================================================== */
 
+/**
+ * mas_walk - Walk to the leaf slot covering mas->index.
+ *
+ * RCU sequence (read-only — no structural changes):
+ *  1. Walk top-down via mt_rcu_dereference() at each level.
+ *  2. Populate mas->node/min/max/offset with the leaf position.
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 void *mas_walk(struct ma_state *mas)
 {
     struct maple_tree *mt = mas->tree;
@@ -241,7 +540,7 @@ void *mas_walk(struct ma_state *mas)
     mas->depth = 0;
 
     if (root == NULL) {
-        mas->node = NULL;
+        mas_invalidate(mas);
         return NULL;
     }
 
@@ -272,19 +571,13 @@ void *mas_walk(struct ma_state *mas)
 
         if (mn_is_leaf(node)) {
             void *entry = mt_rcu_dereference(&node->slot[slot]);
-            mas->node = node;
-            mas->min = mn_slot_min(node, slot, node_min);
-            mas->max = mn_pivot(node, slot, node_max);
-            mas->offset = slot;
+            mas_set_slot(mas, node, slot, node_min, node_max);
             return entry;
         }
 
         void *child = mt_rcu_dereference(&node->slot[slot]);
         if (child == NULL) {
-            mas->node = node;
-            mas->min = mn_slot_min(node, slot, node_min);
-            mas->max = mn_pivot(node, slot, node_max);
-            mas->offset = slot;
+            mas_set_slot(mas, node, slot, node_min, node_max);
             return NULL;
         }
 
@@ -522,26 +815,36 @@ static int __mt_insert_into_parent(struct maple_tree *mt,
 {
     if (parent->slot_len < MAPLE_NODE_SLOTS) {
         uint8_t len = parent->slot_len;
+
+        /*
+         * RCU mode: copy-on-write the parent so readers never see a
+         * partially-shifted node.
+         */
+        struct maple_node *target = parent;
+        if (mt_in_rcu(mt)) {
+            target = mn_copy_node(parent);
+            if (target == NULL)
+                return -ENOMEM;
+        }
+
         for (int i = len; i > (int)slot + 1; i--) {
-            parent->slot[i] = parent->slot[i - 1];
+            target->slot[i] = parent->slot[i - 1];
             if (i - 1 < MAPLE_NODE_PIVOTS)
-                parent->pivot[i - 1] = parent->pivot[i - 2];
+                target->pivot[i - 1] = parent->pivot[i - 2];
             if (!mn_is_leaf(parent))
-                parent->gap[i] = parent->gap[i - 1];
+                target->gap[i] = parent->gap[i - 1];
         }
-        parent->slot[slot + 1] = right;
-        parent->pivot[slot] = pivot_val;
-        parent->slot_len = len + 1;
+        target->pivot[slot] = pivot_val;
+        target->slot_len = len + 1;
 
-        mn_set_parent(right, parent, slot + 1);
+        mn_link_child(target, slot + 1, right);
 
-        if (!mn_is_leaf(parent)) {
-            for (uint8_t i = slot + 2; i < parent->slot_len; i++) {
-                struct maple_node *child = parent->slot[i];
-                if (child != NULL)
-                    mn_set_parent(child, parent, i);
-            }
-        }
+        if (!mn_is_leaf(target))
+            mn_reparent_children(target, 0, target->slot_len);
+
+        if (mt_in_rcu(mt))
+            mn_replace_node(mt, parent, target);
+
         return 0;
     }
 
@@ -592,66 +895,79 @@ static int __mt_split_node(struct maple_tree *mt, struct maple_node *node,
 
     uint8_t split = node->slot_len >> 1;
     uint64_t median = node->pivot[split - 1];
-    right->type = node->type;
+    mn_set_type(right, mn_get_type(node));
 
     uint8_t right_len = node->slot_len - split;
-    for (uint8_t i = 0; i < right_len; i++) {
-        right->slot[i] = node->slot[split + i];
-        if (i < right_len - 1 && (split + i) < MAPLE_NODE_PIVOTS)
-            right->pivot[i] = node->pivot[split + i];
-        if (!mn_is_leaf(node))
-            right->gap[i] = node->gap[split + i];
-    }
+    mn_copy_entries(right, 0, node, split, right_len, !mn_is_leaf(node));
     right->slot_len = right_len;
 
-    if (!mn_is_leaf(right)) {
-        for (uint8_t i = 0; i < right_len; i++) {
-            struct maple_node *child = right->slot[i];
-            if (child != NULL)
-                mn_set_parent(child, right, i);
+    if (!mn_is_leaf(right))
+        mn_reparent_children(right, 0, right_len);
+
+    /*
+     * RCU mode: copy-on-write the left half instead of mutating in place.
+     * Non-RCU: modify node directly.
+     */
+    struct maple_node *left = node;
+    if (mt_in_rcu(mt)) {
+        left = mn_copy_node(node);
+        if (left == NULL) {
+            mt_free_node_now(right);
+            return -ENOMEM;
         }
     }
+    /* Clear the right-half slots/gaps on left to avoid stale pointers. */
+    mn_truncate(left, split);
 
-    node->slot_len = split;
+    if (!mn_is_leaf(left) && mt_in_rcu(mt))
+        mn_reparent_children(left, 0, split);
 
     if (mn_is_root(node)) {
         struct maple_node *new_root = mt_alloc_node();
         if (new_root == NULL) {
-            /* Undo split. */
-            for (uint8_t i = 0; i < right_len; i++) {
-                node->slot[split + i] = right->slot[i];
-                if (i < right_len - 1 && (split + i) < MAPLE_NODE_PIVOTS)
-                    node->pivot[split + i] = right->pivot[i];
+            if (mt_in_rcu(mt)) {
+                mt_free_node_now(left);
+            } else {
+                /* Undo split. */
+                mn_copy_entries(node, split, right, 0, right_len,
+                                !mn_is_leaf(node));
+                node->slot_len = split + right_len;
                 if (!mn_is_leaf(node))
-                    node->gap[split + i] = right->gap[i];
-            }
-            node->slot_len = split + right_len;
-            if (!mn_is_leaf(node)) {
-                for (uint8_t i = split; i < node->slot_len; i++) {
-                    struct maple_node *child = node->slot[i];
-                    if (child != NULL)
-                        mn_set_parent(child, node, i);
-                }
+                    mn_reparent_children(node, split, node->slot_len);
             }
             mt_free_node_now(right);
             return -ENOMEM;
         }
-        new_root->type = maple_arange_64;
-        new_root->slot[0] = node;
-        new_root->slot[1] = right;
+        mn_set_type(new_root, maple_arange_64);
         new_root->pivot[0] = median;
         new_root->slot_len = 2;
 
         mn_set_root(new_root);
-        mn_set_parent(node, new_root, 0);
-        mn_set_parent(right, new_root, 1);
+        mn_link_child(new_root, 0, left);
+        mn_link_child(new_root, 1, right);
 
         mt_rcu_assign_pointer(&mt->ma_root, mt_mk_root(new_root));
+
+        if (mt_in_rcu(mt)) {
+            mn_mark_dead(node);
+            mt_free_node_rcu(node);
+        }
         return 0;
     }
 
     struct maple_node *parent = mn_get_parent(node);
     uint8_t pslot = mn_get_parent_slot(node);
+
+    /*
+     * In RCU mode, replace node with left in the parent slot before
+     * inserting right, so __mt_insert_into_parent sees the new left.
+     */
+    if (mt_in_rcu(mt)) {
+        mn_set_parent(left, parent, pslot);
+        mt_rcu_assign_pointer(&parent->slot[pslot], left);
+        mn_mark_dead(node);
+        mt_free_node_rcu(node);
+    }
 
     uint64_t pmin, pmax;
     __find_node_bounds(mt, parent, &pmin, &pmax);
@@ -659,21 +975,13 @@ static int __mt_split_node(struct maple_tree *mt, struct maple_node *node,
     int ret = __mt_insert_into_parent(mt, parent, pslot, median, right,
                                        pmin, pmax);
     if (ret != 0) {
-        /* Undo split. */
-        for (uint8_t i = 0; i < right_len; i++) {
-            node->slot[split + i] = right->slot[i];
-            if (i < right_len - 1 && (split + i) < MAPLE_NODE_PIVOTS)
-                node->pivot[split + i] = right->pivot[i];
+        if (!mt_in_rcu(mt)) {
+            /* Undo split (non-RCU only — in RCU mode node is already dead). */
+            mn_copy_entries(node, split, right, 0, right_len,
+                            !mn_is_leaf(node));
+            node->slot_len = split + right_len;
             if (!mn_is_leaf(node))
-                node->gap[split + i] = right->gap[i];
-        }
-        node->slot_len = split + right_len;
-        if (!mn_is_leaf(node)) {
-            for (uint8_t i = split; i < node->slot_len; i++) {
-                struct maple_node *child = node->slot[i];
-                if (child != NULL)
-                    mn_set_parent(child, node, i);
-            }
+                mn_reparent_children(node, split, node->slot_len);
         }
         mt_free_node_now(right);
         return ret;
@@ -687,7 +995,8 @@ static int __mt_split_node(struct maple_tree *mt, struct maple_node *node,
 
 static int __mt_store_leaf(struct maple_tree *mt, struct maple_node *node,
                             uint8_t slot, uint64_t node_min, uint64_t node_max,
-                            uint64_t first, uint64_t last, void *entry)
+                            uint64_t first, uint64_t last, void *entry,
+                            struct maple_node **new_out)
 {
     uint64_t slot_min = mn_slot_min(node, slot, node_min);
     uint64_t slot_max = mn_pivot(node, slot, node_max);
@@ -707,7 +1016,10 @@ static int __mt_store_leaf(struct maple_tree *mt, struct maple_node *node,
         int ret = __mt_split_node(mt, node, node_min, node_max);
         if (ret != 0)
             return ret;
-        return mtree_store_range(mt, first, last, entry);
+        ret = mtree_store_range(mt, first, last, entry);
+        /* Return 1 (positive) to tell caller the store completed via
+         * re-walk; node may be dead in RCU mode, so skip post-processing. */
+        return ret != 0 ? ret : 1;
     }
 
     int n_pieces = 1 + need_left + need_right;
@@ -732,21 +1044,34 @@ static int __mt_store_leaf(struct maple_tree *mt, struct maple_node *node,
     uint8_t old_len = node->slot_len;
     uint8_t new_len = old_len + (uint8_t)extra;
 
+    /*
+     * RCU mode: copy-on-write.  Build the new layout on a fresh node.
+     * The copy is NOT published yet — the caller does that after
+     * coalescing via mn_replace_node().
+     */
+    struct maple_node *target = node;
+    if (mt_in_rcu(mt)) {
+        target = mn_copy_node(node);
+        if (target == NULL)
+            return -ENOMEM;
+    }
+
     for (int i = new_len - 1; i >= (int)slot + n_pieces; i--) {
         int src = i - extra;
-        node->slot[i] = node->slot[src];
+        target->slot[i] = node->slot[src];
         if (src < (int)old_len - 1)
-            node->pivot[i] = node->pivot[src];
+            target->pivot[i] = node->pivot[src];
     }
 
-    for (int i = 0; i < n_pieces; i++) {
-        int dst = slot + i;
-        node->slot[dst] = p_slot[i];
-        if (dst < (int)new_len - 1)
-            node->pivot[dst] = p_pivot[i];
-    }
+    mn_write_slots(target, slot, p_slot, p_pivot, (uint8_t)n_pieces,
+                    new_len);
 
-    node->slot_len = new_len;
+    target->slot_len = new_len;
+
+    /* In RCU mode, return the unpublished new node via *new_out. */
+    if (mt_in_rcu(mt))
+        *new_out = target;
+
     return 0;
 }
 
@@ -773,6 +1098,28 @@ static void __mt_coalesce_leaf(struct maple_node *node, uint64_t node_max)
     node->slot_len = dst + 1;
 }
 
+/**
+ * mtree_store_range - Store @entry for indices [@first, @last].
+ *
+ * RCU sequence (per affected leaf, and per parent on split):
+ *  1. Walk to the target leaf (no RCU dereference needed — write-locked).
+ *  2. mn_copy_node() — allocate a new node, shallow-copy the old.
+ *  3. Modify the copy (insert/split slots, update pivots).
+ *  4. mn_reparent_children() — update children's parent back-pointers
+ *     to the new node (safe: readers traverse top-down, not bottom-up).
+ *  5. mn_replace_node() — single rcu_assign_pointer() into the parent
+ *     slot (or ma_root), then mark old node dead, RCU-defer-free it.
+ *  6. __mt_propagate_gaps_from() — update gap[] values upward.
+ *
+ * For exact-match slot overwrites, steps 2–5 are skipped; only
+ * rcu_assign_pointer on the slot is needed (tier A — in-place store).
+ *
+ * On split: the leaf is COW'd first, then __mt_insert_into_parent()
+ * COW's the parent (same 5-step sequence) to add the new right child.
+ * If the parent is also full, it splits recursively upward.
+ *
+ * Caller must hold the tree lock.
+ */
 int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
                        void *entry)
 {
@@ -786,7 +1133,7 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
         struct maple_node *node = mt_alloc_node();
         if (node == NULL)
             return -ENOMEM;
-        node->type = maple_leaf_64;
+        mn_set_type(node, maple_leaf_64);
         if (first > 0) {
             node->slot[0] = NULL;
             node->pivot[0] = first - 1;
@@ -817,7 +1164,7 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
         struct maple_node *node = mt_alloc_node();
         if (node == NULL)
             return -ENOMEM;
-        node->type = maple_leaf_64;
+        mn_set_type(node, maple_leaf_64);
         node->slot[0] = root;
         node->slot_len = 1;
         mn_set_root(node);
@@ -839,11 +1186,10 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
             child = mt_alloc_node();
             if (child == NULL)
                 return -ENOMEM;
-            child->type = maple_leaf_64;
+            mn_set_type(child, maple_leaf_64);
             child->slot[0] = NULL;
             child->slot_len = 1;
-            mn_set_parent(child, node, slot);
-            mt_rcu_assign_pointer(&node->slot[slot], child);
+            mn_link_child(node, slot, child);
         }
         node_min = child_min;
         node_max = child_max;
@@ -859,14 +1205,20 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
                                           node->slot_len);
 
     if (start_slot == end_slot) {
+        struct maple_node *new_node = NULL;
         int ret = __mt_store_leaf(mt, node, start_slot, node_min, node_max,
-                                  first, last, entry);
+                                  first, last, entry, &new_node);
+        if (ret > 0)
+            return 0; /* split+re-walk completed the store */
         if (ret != 0)
             return ret;
-        __mt_coalesce_leaf(node, node_max);
+        struct maple_node *live = new_node ? new_node : node;
+        __mt_coalesce_leaf(live, node_max);
+        if (new_node)
+            mn_replace_node(mt, node, new_node);
         if (orig_last > node_max)
             return mtree_store_range(mt, node_max + 1, orig_last, entry);
-        __mt_propagate_gaps_from(mt, node);
+        __mt_propagate_gaps_from(mt, live);
         return 0;
     }
 
@@ -913,34 +1265,44 @@ int mtree_store_range(struct maple_tree *mt, uint64_t first, uint64_t last,
 
     int trail_start_src = end_slot + 1;
 
+    /*
+     * RCU mode: copy-on-write.  Build the new layout on a fresh node.
+     */
+    struct maple_node *target = node;
+    if (mt_in_rcu(mt)) {
+        target = mn_copy_node(node);
+        if (target == NULL)
+            return -ENOMEM;
+    }
+
     if (delta > 0) {
         for (int i = (int)old_len - 1; i >= trail_start_src; i--) {
             int d = i + delta;
-            node->slot[d] = node->slot[i];
+            target->slot[d] = node->slot[i];
             if (i < (int)old_len - 1)
-                node->pivot[d] = node->pivot[i];
+                target->pivot[d] = node->pivot[i];
         }
     } else if (delta < 0) {
         for (int i = trail_start_src; i < (int)old_len; i++) {
             int d = i + delta;
-            node->slot[d] = node->slot[i];
+            target->slot[d] = node->slot[i];
             if (i < (int)old_len - 1)
-                node->pivot[d] = node->pivot[i];
+                target->pivot[d] = node->pivot[i];
         }
     }
 
-    for (int i = 0; i < n_pieces; i++) {
-        int dst = start_slot + i;
-        node->slot[dst] = p_slot[i];
-        if (dst < (int)new_len - 1)
-            node->pivot[dst] = p_pivot[i];
-    }
+    mn_write_slots(target, start_slot, p_slot, p_pivot, (uint8_t)n_pieces,
+                    new_len);
 
-    node->slot_len = new_len;
-    __mt_coalesce_leaf(node, node_max);
+    target->slot_len = new_len;
+    __mt_coalesce_leaf(target, node_max);
+
+    if (mt_in_rcu(mt))
+        mn_replace_node(mt, node, target);
+
     if (orig_last > node_max)
         return mtree_store_range(mt, node_max + 1, orig_last, entry);
-    __mt_propagate_gaps_from(mt, node);
+    __mt_propagate_gaps_from(mt, target);
     return 0;
 }
 
@@ -1043,7 +1405,9 @@ static void __mt_merge_leaves(struct maple_tree *mt,
                               struct maple_node *left,
                               struct maple_node *right,
                               struct maple_node *parent,
-                              uint8_t left_slot)
+                              uint8_t left_slot,
+                              struct maple_node **merged_out,
+                              struct maple_node **parent_out)
 {
     uint8_t right_slot = left_slot + 1;
     uint64_t pmin, pmax;
@@ -1051,50 +1415,57 @@ static void __mt_merge_leaves(struct maple_tree *mt,
     uint64_t left_max = mn_pivot(parent, left_slot, pmax);
     uint64_t right_max = mn_pivot(parent, right_slot, pmax);
 
-    /* Append right's entries after left's. */
-    uint8_t dst = left->slot_len;
-    /* The last pivot in left needs to be set to left_max (boundary). */
-    if (dst > 0 && dst - 1 < MAPLE_NODE_PIVOTS)
-        left->pivot[dst - 1] = left_max;
-
-    for (uint8_t i = 0; i < right->slot_len; i++) {
-        left->slot[dst + i] = right->slot[i];
-        if (i < right->slot_len - 1 && (dst + i) < MAPLE_NODE_PIVOTS)
-            left->pivot[dst + i] = right->pivot[i];
+    /*
+     * Build the merged leaf — in RCU mode on a new node, otherwise
+     * modify left in place.
+     */
+    struct maple_node *merged = left;
+    if (mt_in_rcu(mt)) {
+        merged = mn_copy_node(left);
+        if (merged == NULL)
+            return;  /* best-effort: leave tree as-is */
     }
-    left->slot_len = dst + right->slot_len;
 
-    /* Coalesce adjacent identical entries in the merged leaf. */
-    __mt_coalesce_leaf(left, right_max);
+    /* Append right's entries after left's. */
+    uint8_t dst = merged->slot_len;
+    if (dst > 0 && dst - 1 < MAPLE_NODE_PIVOTS)
+        merged->pivot[dst - 1] = left_max;
+
+    mn_copy_entries(merged, dst, right, 0, right->slot_len, false);
+    merged->slot_len = dst + right->slot_len;
+
+    __mt_coalesce_leaf(merged, right_max);
 
     /*
-     * Update parent pivot[left_slot] to cover the right node's range,
-     * since left now spans [left_min, right_max].
+     * Update parent: pivot[left_slot] = right_max, remove right_slot.
+     * In RCU mode, COW the parent.
      */
+    struct maple_node *new_parent = parent;
+    if (mt_in_rcu(mt)) {
+        new_parent = mn_copy_node(parent);
+        if (new_parent == NULL) {
+            mt_free_node_now(merged);
+            return;
+        }
+    }
+
+    new_parent->slot[left_slot] = merged;
     if (left_slot < MAPLE_NODE_PIVOTS)
-        parent->pivot[left_slot] = right_max;
+        new_parent->pivot[left_slot] = right_max;
 
-    /* Remove right_slot from the parent. */
-    for (uint8_t i = right_slot; i + 1 < parent->slot_len; i++) {
-        parent->slot[i] = parent->slot[i + 1];
-        if (i < MAPLE_NODE_PIVOTS && i + 1 < parent->slot_len - 1)
-            parent->pivot[i] = parent->pivot[i + 1];
-        if (!mn_is_leaf(parent))
-            parent->gap[i] = parent->gap[i + 1];
-    }
-    parent->slot_len--;
+    /* Shift out the right_slot. */
+    mn_shift_down(new_parent, right_slot);
 
-    /* Clear the now-unused last slot. */
-    parent->slot[parent->slot_len] = NULL;
+    /* Fix up parent_slot encoding for all children of new parent. */
+    mn_reparent_children(new_parent, 0, new_parent->slot_len);
 
-    /* Fix parent_slot for children after the removed slot. */
-    for (uint8_t i = right_slot; i < parent->slot_len; i++) {
-        struct maple_node *child = parent->slot[i];
-        if (child != NULL)
-            mn_set_parent(child, parent, i);
-    }
+    /*
+     * Publish and cleanup are deferred to __mt_rebalance_node so that
+     * cascading merges can be committed atomically in RCU mode.
+     */
 
-    mt_free_node_rcu(right);
+    *merged_out = merged;
+    *parent_out = new_parent;
 }
 
 /**
@@ -1106,7 +1477,9 @@ static void __mt_merge_internal(struct maple_tree *mt,
                                 struct maple_node *left,
                                 struct maple_node *right,
                                 struct maple_node *parent,
-                                uint8_t left_slot)
+                                uint8_t left_slot,
+                                struct maple_node **merged_out,
+                                struct maple_node **parent_out)
 {
     uint8_t right_slot = left_slot + 1;
     uint64_t pmin, pmax;
@@ -1114,47 +1487,55 @@ static void __mt_merge_internal(struct maple_tree *mt,
     uint64_t left_max = mn_pivot(parent, left_slot, pmax);
     uint64_t right_max = mn_pivot(parent, right_slot, pmax);
 
-    uint8_t dst = left->slot_len;
-    /* Set the pivot between the last left entry and first right entry. */
+    /*
+     * Build the merged internal node — COW in RCU mode.
+     */
+    struct maple_node *merged = left;
+    if (mt_in_rcu(mt)) {
+        merged = mn_copy_node(left);
+        if (merged == NULL)
+            return;
+    }
+
+    uint8_t dst = merged->slot_len;
     if (dst > 0 && dst - 1 < MAPLE_NODE_PIVOTS)
-        left->pivot[dst - 1] = left_max;
+        merged->pivot[dst - 1] = left_max;
 
-    for (uint8_t i = 0; i < right->slot_len; i++) {
-        left->slot[dst + i] = right->slot[i];
-        if (i < right->slot_len - 1 && (dst + i) < MAPLE_NODE_PIVOTS)
-            left->pivot[dst + i] = right->pivot[i];
-        left->gap[dst + i] = right->gap[i];
+    mn_copy_entries(merged, dst, right, 0, right->slot_len, true);
+    merged->slot_len = dst + right->slot_len;
+
+    /* Re-parent all children to point at merged. */
+    mn_reparent_children(merged, 0, merged->slot_len);
+
+    /*
+     * Update parent: replace left with merged, remove right.
+     * COW the parent in RCU mode.
+     */
+    struct maple_node *new_parent = parent;
+    if (mt_in_rcu(mt)) {
+        new_parent = mn_copy_node(parent);
+        if (new_parent == NULL) {
+            if (mt_in_rcu(mt))
+                mt_free_node_now(merged);
+            return;
+        }
     }
-    left->slot_len = dst + right->slot_len;
 
-    /* Re-parent all children that moved from right to left. */
-    for (uint8_t i = dst; i < left->slot_len; i++) {
-        struct maple_node *child = left->slot[i];
-        if (child != NULL)
-            mn_set_parent(child, left, i);
-    }
-
-    /* Update parent pivot to cover right's range. */
+    new_parent->slot[left_slot] = merged;
     if (left_slot < MAPLE_NODE_PIVOTS)
-        parent->pivot[left_slot] = right_max;
+        new_parent->pivot[left_slot] = right_max;
 
-    /* Remove right_slot from parent. */
-    for (uint8_t i = right_slot; i + 1 < parent->slot_len; i++) {
-        parent->slot[i] = parent->slot[i + 1];
-        if (i < MAPLE_NODE_PIVOTS && i + 1 < parent->slot_len - 1)
-            parent->pivot[i] = parent->pivot[i + 1];
-        parent->gap[i] = parent->gap[i + 1];
-    }
-    parent->slot_len--;
-    parent->slot[parent->slot_len] = NULL;
+    mn_shift_down(new_parent, right_slot);
 
-    for (uint8_t i = right_slot; i < parent->slot_len; i++) {
-        struct maple_node *child = parent->slot[i];
-        if (child != NULL)
-            mn_set_parent(child, parent, i);
-    }
+    mn_reparent_children(new_parent, 0, new_parent->slot_len);
 
-    mt_free_node_rcu(right);
+    /*
+     * Publish and cleanup are deferred to __mt_rebalance_node so that
+     * cascading merges can be committed atomically in RCU mode.
+     */
+
+    *merged_out = merged;
+    *parent_out = new_parent;
 }
 
 /**
@@ -1175,7 +1556,10 @@ static void __mt_redistribute_leaves(struct maple_tree *mt,
                                      struct maple_node *sibling,
                                      struct maple_node *parent,
                                      uint8_t node_slot,
-                                     uint8_t sib_slot)
+                                     uint8_t sib_slot,
+                                     struct maple_node **node_out,
+                                     struct maple_node **sib_out,
+                                     struct maple_node **parent_out)
 {
     /* Determine left/right ordering. */
     struct maple_node *left, *right;
@@ -1226,39 +1610,83 @@ static void __mt_redistribute_leaves(struct maple_tree *mt,
     uint8_t left_new = total >> 1;
     uint8_t right_new = total - left_new;
 
-    /* Refill left. */
-    for (uint8_t i = 0; i < left_new; i++) {
-        left->slot[i] = tmp_slot[i];
-        if (i < left_new - 1)
-            left->pivot[i] = tmp_pivot[i];
+    /*
+     * RCU mode: allocate new left and right nodes, fill them,
+     * then COW the parent to swap both slots atomically.
+     */
+    struct maple_node *new_left = left;
+    struct maple_node *new_right = right;
+    if (mt_in_rcu(mt)) {
+        new_left = mt_alloc_node();
+        new_right = mt_alloc_node();
+        if (new_left == NULL || new_right == NULL) {
+            if (new_left) mt_free_node_now(new_left);
+            if (new_right) mt_free_node_now(new_right);
+            return;
+        }
+        mn_set_type(new_left, mn_get_type(left));
+        mn_set_type(new_right, mn_get_type(right));
     }
-    left->slot_len = left_new;
-    /* Clear old trailing slots. */
-    for (uint8_t i = left_new; i < MAPLE_NODE_SLOTS; i++)
-        left->slot[i] = NULL;
+
+    /* Refill left. */
+    mn_write_slots(new_left, 0, tmp_slot, tmp_pivot, left_new, left_new);
+    mn_truncate(new_left, left_new);
 
     /* Refill right. */
-    for (uint8_t i = 0; i < right_new; i++) {
-        right->slot[i] = tmp_slot[left_new + i];
-        if (i < right_new - 1)
-            right->pivot[i] = tmp_pivot[left_new + i];
-    }
-    right->slot_len = right_new;
-    for (uint8_t i = right_new; i < MAPLE_NODE_SLOTS; i++)
-        right->slot[i] = NULL;
+    mn_write_slots(new_right, 0, &tmp_slot[left_new], &tmp_pivot[left_new],
+                   right_new, right_new);
+    mn_truncate(new_right, right_new);
 
-    /* Update parent pivot: left's new upper bound. */
-    parent->pivot[left_slot] = tmp_pivot[left_new - 1];
+    /*
+     * Update parent pivot and slot pointers.
+     * In RCU mode, COW the parent.
+     */
+    struct maple_node *new_parent = parent;
+    if (mt_in_rcu(mt)) {
+        new_parent = mn_copy_node(parent);
+        if (new_parent == NULL) {
+            mt_free_node_now(new_left);
+            mt_free_node_now(new_right);
+            return;
+        }
+    }
+
+    new_parent->slot[left_slot] = new_left;
+    new_parent->slot[left_slot + 1] = new_right;
+    new_parent->pivot[left_slot] = tmp_pivot[left_new - 1];
+    mn_reparent_children(new_parent, 0, new_parent->slot_len);
+
+    /*
+     * Publish and cleanup are deferred to __mt_rebalance_node so that
+     * the commit is atomic in RCU mode.
+     */
+
+    /* Return the new nodes for the caller's gap propagation. */
+    if (node_slot < sib_slot) {
+        *node_out = new_left;
+        *sib_out = new_right;
+    } else {
+        *node_out = new_right;
+        *sib_out = new_left;
+    }
+    *parent_out = new_parent;
 }
 
 /**
- * __mt_rebalance_node - Try to rebalance a node after erasure.
+ * __mt_rebalance_node - Rebalance a node after erasure (batched RCU commit).
  *
  * Called when a node drops below MAPLE_NODE_MIN entries.
- * Tries to merge with a sibling first (if combined <= MAPLE_NODE_SLOTS).
- * Falls back to redistribution otherwise.
- * After merging, rebalances the parent recursively if it becomes underfull.
- * Finally, shrinks the tree root if it has only one child.
+ * Tries to merge with a sibling (if combined <= MAPLE_NODE_SLOTS),
+ * falling back to leaf redistribution otherwise.
+ *
+ * In RCU mode, cascading merges at successive tree levels are collected
+ * without publishing.  A single mn_replace_node() at the topmost affected
+ * ancestor then atomically commits the entire rebalance to readers.
+ * All old live nodes are RCU-freed after the commit; intermediate new nodes
+ * that were never published are freed immediately.
+ *
+ * In non-RCU mode, in-place modifications need no batching; only the
+ * removed right node is freed at each level.
  */
 static void __mt_rebalance_node(struct maple_tree *mt,
                                 struct maple_node *node)
@@ -1271,63 +1699,191 @@ static void __mt_rebalance_node(struct maple_tree *mt,
     if (node->slot_len >= MAPLE_NODE_MIN)
         return;
 
-    uint8_t sib_slot;
-    bool is_right;
-    struct maple_node *sibling = __mt_get_sibling(node, &sib_slot, &is_right);
-    if (sibling == NULL)
-        return;
+    /*
+     * Batch state (RCU mode only):
+     *   dead[]  – old live nodes to mark dead + RCU-free after commit.
+     *   unpub[] – intermediate new nodes never published; immediate-free.
+     *   top_old/top_new – topmost (old, new) parent pair for the single
+     *                     mn_replace_node() publish.
+     *   first_merged – bottommost merged node for gap propagation.
+     */
+#define MT_REBAL_MAX_DEAD  24   /* ≤3 per level × 8 levels */
+#define MT_REBAL_MAX_UNPUB  8   /* ≤1 per level */
+    struct maple_node *dead[MT_REBAL_MAX_DEAD];
+    int n_dead = 0;
+    struct maple_node *unpub[MT_REBAL_MAX_UNPUB];
+    int n_unpub = 0;
+    struct maple_node *top_old = NULL;
+    struct maple_node *top_new = NULL;
+    struct maple_node *first_merged = NULL;
 
-    struct maple_node *parent = mn_get_parent(node);
-    uint8_t node_slot = mn_get_parent_slot(node);
-    uint8_t combined = node->slot_len + sibling->slot_len;
+    /* Track whether cur was newly allocated (never published). */
+    bool cur_is_new = false;
 
-    if (combined <= MAPLE_NODE_SLOTS) {
-        /* Merge: put everything into the left node, free the right. */
-        struct maple_node *left, *right;
-        uint8_t left_slot;
-        if (!is_right) {
-            /* sibling is to the left of node */
-            left = sibling;
-            right = node;
-            left_slot = sib_slot;
+    /* For redistribute at the leaf level. */
+    bool did_redistribute = false;
+    struct maple_node *redist_node = NULL;
+    struct maple_node *redist_sib = NULL;
+
+    struct maple_node *cur = node;
+
+    while (!mn_is_root(cur) && cur->slot_len < MAPLE_NODE_MIN) {
+        uint8_t sib_slot;
+        bool is_right;
+        struct maple_node *sibling =
+            __mt_get_sibling(cur, &sib_slot, &is_right);
+        if (sibling == NULL)
+            break;
+
+        struct maple_node *parent = mn_get_parent(cur);
+        uint8_t cur_slot = mn_get_parent_slot(cur);
+        uint8_t combined = cur->slot_len + sibling->slot_len;
+
+        if (combined <= MAPLE_NODE_SLOTS) {
+            /* --- Merge --- */
+            struct maple_node *left, *right;
+            uint8_t left_slot;
+            if (!is_right) {
+                left = sibling;
+                right = cur;
+                left_slot = sib_slot;
+            } else {
+                left = cur;
+                right = sibling;
+                left_slot = cur_slot;
+            }
+
+            struct maple_node *merged, *new_parent;
+            if (mn_is_leaf(left))
+                __mt_merge_leaves(mt, left, right, parent, left_slot,
+                                  &merged, &new_parent);
+            else
+                __mt_merge_internal(mt, left, right, parent, left_slot,
+                                    &merged, &new_parent);
+
+            if (!first_merged)
+                first_merged = merged;
+
+            if (mt_in_rcu(mt)) {
+                /*
+                 * sibling is always live in the tree.
+                 * cur is live at level 0, or never-published at level > 0.
+                 */
+                dead[n_dead++] = sibling;
+                if (cur_is_new)
+                    unpub[n_unpub++] = cur;
+                else
+                    dead[n_dead++] = cur;
+
+                /*
+                 * The previous top_old (if any) is a live ancestor that
+                 * becomes unreachable once the topmost publish replaces
+                 * its successor.  Defer-free it.
+                 */
+                if (top_old)
+                    dead[n_dead++] = top_old;
+
+                top_old = parent;
+                top_new = new_parent;
+            } else {
+                /* Non-RCU: in-place; just free the removed right node. */
+                mn_mark_dead(right);
+                mt_free_node_now(right);
+            }
+
+            /* Check whether the parent is now underfull. */
+            cur = new_parent;
+            cur_is_new = true;
         } else {
-            left = node;
-            right = sibling;
-            left_slot = node_slot;
+            /* --- Redistribute (leaf only) --- */
+            if (mn_is_leaf(cur)) {
+                struct maple_node *new_par;
+                struct maple_node *live_node, *live_sib;
+                __mt_redistribute_leaves(mt, cur, sibling, parent,
+                                         cur_slot, sib_slot,
+                                         &live_node, &live_sib,
+                                         &new_par);
+
+                if (mt_in_rcu(mt)) {
+                    dead[n_dead++] = cur;
+                    dead[n_dead++] = sibling;
+                    if (top_old)
+                        dead[n_dead++] = top_old;
+                    top_old = parent;
+                    top_new = new_par;
+                }
+
+                did_redistribute = true;
+                redist_node = live_node;
+                redist_sib = live_sib;
+            }
+            /*
+             * Internal-node redistribution is unsupported; stop here.
+             * The tree may have a slightly underfull internal node,
+             * which is suboptimal but structurally correct.
+             */
+            break;
         }
-
-        if (mn_is_leaf(left))
-            __mt_merge_leaves(mt, left, right, parent, left_slot);
-        else
-            __mt_merge_internal(mt, left, right, parent, left_slot);
-
-        /* Propagate gaps from the merged node upward. */
-        __mt_propagate_gaps_from(mt, left);
-
-        /* Parent may now be underfull — rebalance recursively. */
-        if (!mn_is_root(parent) && parent->slot_len < MAPLE_NODE_MIN)
-            __mt_rebalance_node(mt, parent);
-
-        /* Root may now have only one child. */
-        __mt_shrink_root(mt);
-    } else {
-        /* Cannot merge — redistribute entries between the two nodes. */
-        if (mn_is_leaf(node)) {
-            __mt_redistribute_leaves(mt, node, sibling, parent,
-                                     node_slot, sib_slot);
-        }
-        /* Note: internal-node redistribution is complex and rarely needed
-         * since parent underflow is handled by recursive merge above.
-         * Leaf redistribution covers the common case. */
-        __mt_propagate_gaps_from(mt, node);
-        __mt_propagate_gaps_from(mt, sibling);
     }
+
+    /* --- Commit --- */
+    if (mt_in_rcu(mt) && top_old && top_new) {
+        /*
+         * Single atomic publish of the topmost new parent.
+         * mn_replace_node() also marks top_old dead and RCU-frees it.
+         */
+        mn_replace_node(mt, top_old, top_new);
+
+        /* RCU-free all other old live nodes that are now unreachable. */
+        for (int i = 0; i < n_dead; i++) {
+            mn_mark_dead(dead[i]);
+            mt_free_node_rcu(dead[i]);
+        }
+
+        /* Immediately free intermediate nodes never visible to readers. */
+        for (int i = 0; i < n_unpub; i++)
+            mt_free_node_now(unpub[i]);
+    }
+
+    /* --- Gap propagation (after commit so parent chain is live) --- */
+    if (did_redistribute) {
+        __mt_propagate_gaps_from(mt, redist_node);
+        __mt_propagate_gaps_from(mt, redist_sib);
+    } else if (first_merged) {
+        __mt_propagate_gaps_from(mt, first_merged);
+    }
+
+    __mt_shrink_root(mt);
+
+#undef MT_REBAL_MAX_DEAD
+#undef MT_REBAL_MAX_UNPUB
 }
 
 /* ====================================================================== */
 /*  Erase                                                                  */
 /* ====================================================================== */
 
+/**
+ * mtree_erase - Remove the entry at @index, return it.
+ *
+ * RCU sequence:
+ *  1. Walk to the target leaf.
+ *  2. mn_copy_node() — COW the leaf.
+ *  3. Null out the slot on the copy, coalesce adjacent NULL ranges.
+ *  4. mn_replace_node() — single rcu_assign_pointer() into the parent
+ *     slot (or ma_root), mark old node dead, RCU-defer-free it.
+ *  5. __mt_propagate_gaps_from() — update gap[] values upward.
+ *  6. If the leaf is now underfull, __mt_rebalance_node() runs:
+ *     - Iteratively merge/redistribute with siblings bottom-up.
+ *     - In RCU mode, all per-level COW operations are batched;
+ *       a single mn_replace_node() at the topmost affected ancestor
+ *       atomically publishes the entire rebalance.
+ *     - Old live nodes: mark dead + RCU-defer-free.
+ *     - Intermediate unpublished nodes: immediate free.
+ *  7. __mt_shrink_root() — collapse single-child root if needed.
+ *
+ * Caller must hold the tree lock.
+ */
 void *mtree_erase(struct maple_tree *mt, uint64_t index)
 {
     void *root = mt_rcu_dereference(&mt->ma_root);
@@ -1357,14 +1913,29 @@ void *mtree_erase(struct maple_tree *mt, uint64_t index)
     uint8_t slot = mn_find_slot(node, index, node->slot_len);
 
     void *old = node->slot[slot];
-    node->slot[slot] = NULL;
 
-    __mt_coalesce_leaf(node, node_max);
-    __mt_propagate_gaps_from(mt, node);
+    /*
+     * RCU mode: copy-on-write the leaf, null the slot on the copy,
+     * coalesce, then publish.  Non-RCU: mutate in place.
+     */
+    struct maple_node *target = node;
+    if (mt_in_rcu(mt)) {
+        target = mn_copy_node(node);
+        if (target == NULL)
+            return NULL;  /* allocation failure — tree unchanged */
+    }
+
+    target->slot[slot] = NULL;
+    __mt_coalesce_leaf(target, node_max);
+
+    if (mt_in_rcu(mt))
+        mn_replace_node(mt, node, target);
+
+    __mt_propagate_gaps_from(mt, target);
 
     /* Rebalance if the leaf is underfull and not the root. */
-    if (!mn_is_root(node) && node->slot_len < MAPLE_NODE_MIN)
-        __mt_rebalance_node(mt, node);
+    if (!mn_is_root(target) && target->slot_len < MAPLE_NODE_MIN)
+        __mt_rebalance_node(mt, target);
 
     /* Even without rebalance, the root might have become single-child. */
     __mt_shrink_root(mt);
@@ -1376,6 +1947,14 @@ void *mtree_erase(struct maple_tree *mt, uint64_t index)
 /*  Partial erase (single-index hole punch)                                */
 /* ====================================================================== */
 
+/**
+ * mtree_erase_index - Punch a NULL hole at @index, return the old entry.
+ *
+ * RCU sequence: delegates to mtree_store_range(mt, index, index, NULL).
+ * See mtree_store_range() for the full COW → publish → free sequence.
+ *
+ * Caller must hold the tree lock.
+ */
 void *mtree_erase_index(struct maple_tree *mt, uint64_t index)
 {
     void *old = mtree_load(mt, index);
@@ -1403,6 +1982,15 @@ static void __mt_destroy_walk(struct maple_node *node)
     mt_free_node_now(node);
 }
 
+/**
+ * mtree_destroy - Free all nodes in the tree.
+ *
+ * RCU sequence: none — all nodes are freed immediately via
+ * mt_free_node_now().  The caller must ensure no concurrent readers
+ * (i.e., an RCU grace period has elapsed or exclusive access is held).
+ *
+ * Caller must hold the tree lock (or have exclusive access).
+ */
 void mtree_destroy(struct maple_tree *mt)
 {
     void *root = mt_rcu_dereference(&mt->ma_root);
@@ -1431,7 +2019,7 @@ static void __mt_dump_node(struct maple_node *node, uint64_t node_min,
            depth * 2, "", (void *)node,
            mn_is_leaf(node) ? "LEAF" : "INTERNAL",
            node->slot_len, node_min, node_max,
-           node->parent, node->parent_slot);
+           node->parent, mn_get_parent_slot(node));
     for (uint8_t i = 0; i < node->slot_len; i++) {
         uint64_t smin = mn_slot_min(node, i, node_min);
         uint64_t smax = mn_pivot(node, i, node_max);
@@ -1452,6 +2040,12 @@ static void __mt_dump_node(struct maple_node *node, uint64_t node_min,
     printf("\n");
 }
 
+/**
+ * mt_dump_tree - Print the tree structure to stdout (debug).
+ *
+ * RCU sequence: read-only walk via mt_rcu_dereference().
+ * Caller should hold the tree lock or mt_rcu_lock() for consistency.
+ */
 void mt_dump_tree(struct maple_tree *mt)
 {
     void *root = mt_rcu_dereference(&mt->ma_root);
@@ -1485,11 +2079,9 @@ static void *__mas_next_slot(struct ma_state *mas)
     uint64_t node_min, node_max;
     __find_node_bounds(mas->tree, node, &node_min, &node_max);
 
-    mas->offset = next;
-    mas->min = mn_slot_min(node, next, node_min);
-    mas->max = mn_pivot(node, next, node_max);
+    mas_set_slot(mas, node, next, node_min, node_max);
     mas->index = mas->min;
-    return node->slot[next];
+    return mt_rcu_dereference(&node->slot[next]);
 }
 
 static void *__mas_next_node(struct ma_state *mas, uint64_t limit)
@@ -1508,22 +2100,18 @@ static void *__mas_next_node(struct ma_state *mas, uint64_t limit)
 
             uint64_t child_min = mn_slot_min(parent, next, node_min);
             if (child_min > limit) {
-                mas->node = NULL;
+                mas_invalidate(mas);
                 return NULL;
             }
 
-            struct maple_node *child = parent->slot[next];
+            struct maple_node *child = mt_rcu_dereference(&parent->slot[next]);
             if (child == NULL)
                 continue;
 
             if (mn_is_leaf(parent)) {
                 uint64_t child_max = mn_pivot(parent, next, node_max);
-                mas->node = parent;
-                mas->offset = next;
-                mas->min = child_min;
-                mas->max = child_max;
-                mas->index = child_min;
-                return parent->slot[next];
+                mas_set_pos(mas, parent, next, child_min, child_max);
+                return child;
             }
 
             node = (struct maple_node *)child;
@@ -1532,22 +2120,21 @@ static void *__mas_next_node(struct ma_state *mas, uint64_t limit)
                     uint64_t nmin, nmax;
                     __find_node_bounds(mas->tree, node, &nmin, &nmax);
                     for (uint8_t i = 0; i < node->slot_len; i++) {
-                        if (node->slot[i] == NULL)
+                        void *entry = mt_rcu_dereference(&node->slot[i]);
+                        if (entry == NULL)
                             continue;
-                        mas->node = node;
-                        mas->offset = i;
-                        mas->min = mn_slot_min(node, i, nmin);
-                        mas->max = mn_pivot(node, i, nmax);
+                        mas_set_slot(mas, node, i, nmin, nmax);
                         mas->index = mas->min;
-                        return node->slot[i];
+                        return entry;
                     }
                     break;
                 }
 
                 struct maple_node *next_child = NULL;
                 for (uint8_t i = 0; i < node->slot_len; i++) {
-                    if (node->slot[i] != NULL) {
-                        next_child = (struct maple_node *)node->slot[i];
+                    void *p = mt_rcu_dereference(&node->slot[i]);
+                    if (p != NULL) {
+                        next_child = (struct maple_node *)p;
                         break;
                     }
                 }
@@ -1559,10 +2146,20 @@ static void *__mas_next_node(struct ma_state *mas, uint64_t limit)
         node = parent;
     }
 
-    mas->node = NULL;
+    mas_invalidate(mas);
     return NULL;
 }
 
+/**
+ * mas_next - Advance the cursor to the next non-NULL entry <= @max.
+ *
+ * RCU sequence (read-only):
+ *  1. Try the next slot in the current leaf.
+ *  2. If exhausted, ascend via parent pointers and descend into the
+ *     next subtree, using mt_rcu_dereference() at each slot read.
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 void *mas_next(struct ma_state *mas, uint64_t max)
 {
     while (1) {
@@ -1597,11 +2194,9 @@ static void *__mas_prev_slot(struct ma_state *mas)
     __find_node_bounds(mas->tree, node, &node_min, &node_max);
 
     uint8_t prev = mas->offset - 1;
-    mas->offset = prev;
-    mas->min = mn_slot_min(node, prev, node_min);
-    mas->max = mn_pivot(node, prev, node_max);
+    mas_set_slot(mas, node, prev, node_min, node_max);
     mas->index = mas->min;
-    return node->slot[prev];
+    return mt_rcu_dereference(&node->slot[prev]);
 }
 
 static void *__mas_prev_node(struct ma_state *mas, uint64_t limit)
@@ -1621,22 +2216,19 @@ static void *__mas_prev_node(struct ma_state *mas, uint64_t limit)
             for (int prev = (int)pslot - 1; prev >= 0; prev--) {
                 uint64_t child_max = mn_pivot(parent, (uint8_t)prev, pmax);
                 if (child_max < limit) {
-                    mas->node = NULL;
+                    mas_invalidate(mas);
                     return NULL;
                 }
 
-                void *child = parent->slot[prev];
+                void *child = mt_rcu_dereference(&parent->slot[prev]);
                 if (child == NULL)
                     continue;
 
                 if (mn_is_leaf(parent)) {
                     uint64_t child_min = mn_slot_min(parent, (uint8_t)prev,
                                                       pmin);
-                    mas->node = parent;
-                    mas->offset = (uint8_t)prev;
-                    mas->min = child_min;
-                    mas->max = child_max;
-                    mas->index = child_min;
+                    mas_set_pos(mas, parent, (uint8_t)prev, child_min,
+                                child_max);
                     return child;
                 }
 
@@ -1650,8 +2242,9 @@ static void *__mas_prev_node(struct ma_state *mas, uint64_t limit)
 
                     struct maple_node *nxt = NULL;
                     for (int i = (int)clen - 1; i >= 0; i--) {
-                        if (cursor->slot[i] != NULL) {
-                            nxt = (struct maple_node *)cursor->slot[i];
+                        void *p = mt_rcu_dereference(&cursor->slot[i]);
+                        if (p != NULL) {
+                            nxt = (struct maple_node *)p;
                             break;
                         }
                     }
@@ -1669,25 +2262,32 @@ static void *__mas_prev_node(struct ma_state *mas, uint64_t limit)
                 __find_node_bounds(mas->tree, cursor, &nmin, &nmax);
                 uint8_t last = cursor->slot_len > 0 ?
                                cursor->slot_len - 1 : 0;
-                mas->node = cursor;
-                mas->offset = last;
-                mas->min = mn_slot_min(cursor, last, nmin);
-                mas->max = mn_pivot(cursor, last, nmax);
+                mas_set_slot(mas, cursor, last, nmin, nmax);
                 mas->index = mas->min;
                 if (mas->max < limit) {
-                    mas->node = NULL;
+                    mas_invalidate(mas);
                     return NULL;
                 }
-                return cursor->slot[last];
+                return mt_rcu_dereference(&cursor->slot[last]);
             }
         }
         node = parent;
     }
 
-    mas->node = NULL;
+    mas_invalidate(mas);
     return NULL;
 }
 
+/**
+ * mas_prev - Move the cursor to the previous non-NULL entry >= @min.
+ *
+ * RCU sequence (read-only):
+ *  1. Try the previous slot in the current leaf.
+ *  2. If exhausted, ascend via parent pointers and descend into the
+ *     previous subtree, using mt_rcu_dereference() at each slot read.
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 void *mas_prev(struct ma_state *mas, uint64_t min)
 {
     while (1) {
@@ -1720,6 +2320,15 @@ void *mas_prev(struct ma_state *mas, uint64_t min)
 /*  mas_find                                                               */
 /* ====================================================================== */
 
+/**
+ * mas_find - Find the next non-NULL entry at or after mas->index, up to @max.
+ *
+ * RCU sequence (read-only):
+ *  1. If not yet positioned, mas_walk() to the current index.
+ *  2. Advance via mas_next() using mt_rcu_dereference() for slot reads.
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 void *mas_find(struct ma_state *mas, uint64_t max)
 {
     if (mas->index > max)
@@ -1728,10 +2337,7 @@ void *mas_find(struct ma_state *mas, uint64_t max)
     if (mas->node == NULL) {
         void *entry = mas_walk(mas);
         if (entry != NULL) {
-            if (mas->max == MAPLE_MAX)
-                mas->index = MAPLE_MAX;
-            else
-                mas->index = mas->max + 1;
+            mas_advance_index(mas);
             return entry;
         }
     }
@@ -1741,10 +2347,7 @@ void *mas_find(struct ma_state *mas, uint64_t max)
         if (entry != NULL) {
             if (mas->min > max)
                 return NULL;
-            if (mas->max == MAPLE_MAX)
-                mas->index = MAPLE_MAX;
-            else
-                mas->index = mas->max + 1;
+            mas_advance_index(mas);
             return entry;
         }
 
@@ -1755,10 +2358,7 @@ void *mas_find(struct ma_state *mas, uint64_t max)
         if (entry != NULL) {
             if (mas->min > max)
                 return NULL;
-            if (mas->max == MAPLE_MAX)
-                mas->index = MAPLE_MAX;
-            else
-                mas->index = mas->max + 1;
+            mas_advance_index(mas);
             return entry;
         }
         if (mas->node == NULL)
@@ -1770,11 +2370,27 @@ void *mas_find(struct ma_state *mas, uint64_t max)
 /*  mas_store / mas_erase                                                  */
 /* ====================================================================== */
 
+/**
+ * mas_store - Store @entry at [mas->index, mas->last].
+ *
+ * RCU sequence: delegates to mtree_store_range().
+ * See mtree_store_range() for the full COW → publish → free sequence.
+ *
+ * Caller must hold the tree lock.
+ */
 int mas_store(struct ma_state *mas, void *entry)
 {
     return mtree_store_range(mas->tree, mas->index, mas->last, entry);
 }
 
+/**
+ * mas_erase - Erase the entry at mas->index.
+ *
+ * RCU sequence: delegates to mtree_erase().
+ * See mtree_erase() for the full COW → rebalance → publish → free sequence.
+ *
+ * Caller must hold the tree lock.
+ */
 void *mas_erase(struct ma_state *mas)
 {
     return mtree_erase(mas->tree, mas->index);
@@ -1784,6 +2400,17 @@ void *mas_erase(struct ma_state *mas)
 /*  Gap search                                                             */
 /* ====================================================================== */
 
+/**
+ * mas_empty_area - Find a forward gap of at least @size in [@min, @max].
+ *
+ * RCU sequence (read-only):
+ *  1. Walk the gap[] metadata top-down via mt_rcu_dereference().
+ *  2. At each internal node, skip children whose gap[] < @size.
+ *  3. At the leaf, scan for a contiguous NULL range >= @size.
+ *  4. Set mas->index/last to the found gap.
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 int mas_empty_area(struct ma_state *mas, uint64_t min, uint64_t max,
                     uint64_t size)
 {
@@ -1795,16 +2422,14 @@ int mas_empty_area(struct ma_state *mas, uint64_t min, uint64_t max,
 
     void *root = mt_rcu_dereference(&mas->tree->ma_root);
     if (root == NULL) {
-        mas->index = min;
-        mas->last = min + size - 1;
+        mas_set_gap(mas, min, size);
         return 0;
     }
 
     if (!mt_is_node(root)) {
         if (min == 0 && max == MAPLE_MAX)
             return -EBUSY;
-        mas->index = min;
-        mas->last = min + size - 1;
+        mas_set_gap(mas, min, size);
         return 0;
     }
 
@@ -1813,11 +2438,22 @@ int mas_empty_area(struct ma_state *mas, uint64_t min, uint64_t max,
                            min, max, &gap_start) != 0)
         return -EBUSY;
 
-    mas->index = gap_start;
-    mas->last = gap_start + size - 1;
+    mas_set_gap(mas, gap_start, size);
     return 0;
 }
 
+/**
+ * mas_empty_area_rev - Find a reverse gap of at least @size in [@min, @max].
+ *
+ * RCU sequence (read-only):
+ *  1. Walk the gap[] metadata top-down (right-to-left) via
+ *     mt_rcu_dereference().
+ *  2. At each internal node, skip children whose gap[] < @size.
+ *  3. At the leaf, scan backwards for a contiguous NULL range >= @size.
+ *  4. Set mas->index/last to the found gap (highest address).
+ *
+ * Caller must hold mt_rcu_lock() or the tree lock.
+ */
 int mas_empty_area_rev(struct ma_state *mas, uint64_t min, uint64_t max,
                         uint64_t size)
 {
@@ -1829,16 +2465,14 @@ int mas_empty_area_rev(struct ma_state *mas, uint64_t min, uint64_t max,
 
     void *root = mt_rcu_dereference(&mas->tree->ma_root);
     if (root == NULL) {
-        mas->index = max - size + 1;
-        mas->last = max;
+        mas_set_gap(mas, max - size + 1, size);
         return 0;
     }
 
     if (!mt_is_node(root)) {
         if (min == 0 && max == MAPLE_MAX)
             return -EBUSY;
-        mas->index = max - size + 1;
-        mas->last = max;
+        mas_set_gap(mas, max - size + 1, size);
         return 0;
     }
 
@@ -1847,8 +2481,7 @@ int mas_empty_area_rev(struct ma_state *mas, uint64_t min, uint64_t max,
                            min, max, &gap_start) != 0)
         return -EBUSY;
 
-    mas->index = gap_start;
-    mas->last = gap_start + size - 1;
+    mas_set_gap(mas, gap_start, size);
     return 0;
 }
 
@@ -1856,6 +2489,17 @@ int mas_empty_area_rev(struct ma_state *mas, uint64_t min, uint64_t max,
 /*  RCU read-side helpers                                                  */
 /* ====================================================================== */
 
+/**
+ * mt_find - Find the next non-NULL entry at or after *@index, up to @max.
+ *
+ * RCU sequence (read-only):
+ *  1. mt_rcu_lock()   — enter RCU read-side critical section.
+ *  2. mas_find() — walk/advance via mt_rcu_dereference().
+ *  3. mt_rcu_unlock() — leave critical section.
+ *  4. Advance *@index past the found entry for iteration.
+ *
+ * Write-side locking: none required.
+ */
 void *mt_find(struct maple_tree *mt, uint64_t *index, uint64_t max)
 {
     if (*index > max)
@@ -1874,6 +2518,16 @@ void *mt_find(struct maple_tree *mt, uint64_t *index, uint64_t max)
     return entry;
 }
 
+/**
+ * mt_next - Return the next non-NULL entry after @index, up to @max.
+ *
+ * RCU sequence (read-only):
+ *  1. mt_rcu_lock()   — enter RCU read-side critical section.
+ *  2. mas_walk() + mas_find() via mt_rcu_dereference().
+ *  3. mt_rcu_unlock() — leave critical section.
+ *
+ * Write-side locking: none required.
+ */
 void *mt_next(struct maple_tree *mt, uint64_t index, uint64_t max)
 {
     if (index >= max)
@@ -1891,6 +2545,16 @@ void *mt_next(struct maple_tree *mt, uint64_t index, uint64_t max)
     return entry;
 }
 
+/**
+ * mt_prev - Return the previous non-NULL entry before @index, down to @min.
+ *
+ * RCU sequence (read-only):
+ *  1. mt_rcu_lock()   — enter RCU read-side critical section.
+ *  2. mas_walk() + mas_prev() via mt_rcu_dereference().
+ *  3. mt_rcu_unlock() — leave critical section.
+ *
+ * Write-side locking: none required.
+ */
 void *mt_prev(struct maple_tree *mt, uint64_t index, uint64_t min)
 {
     if (index <= min)

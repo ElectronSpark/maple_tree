@@ -49,9 +49,12 @@
 
 static inline void *mt_alloc_fn(size_t size)
 {
-    void *p = malloc(size);
+    /* Round up to alignment so aligned_alloc succeeds (C11 requirement). */
+    size_t align = 256;
+    size_t alloc_size = (size + align - 1) & ~(align - 1);
+    void *p = aligned_alloc(align, alloc_size);
     if (p)
-        memset(p, 0, size);
+        memset(p, 0, alloc_size);
     return p;
 }
 

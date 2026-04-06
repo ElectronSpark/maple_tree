@@ -25,7 +25,7 @@
 /* ----------------------------------------------------------------------- */
 
 /** Number of child/entry pointers per node (branching factor). */
-#define MAPLE_NODE_SLOTS    16
+#define MAPLE_NODE_SLOTS    10
 
 /** Number of pivot (separator) keys per node. */
 #define MAPLE_NODE_PIVOTS   (MAPLE_NODE_SLOTS - 1)
@@ -53,33 +53,49 @@ enum maple_type {
 };
 
 /* ----------------------------------------------------------------------- */
+/*  Parent-pointer encoding (Linux-style)                                   */
+/* ----------------------------------------------------------------------- */
+
+/**
+ * Nodes are 256-byte aligned, giving 8 usable low bits in any pointer
+ * to a maple_node.  The @parent field packs metadata into these bits:
+ *
+ *   Bit  0     : root flag (1 = this node is the tree root)
+ *   Bits 1–2   : node type (enum maple_type of this node)
+ *   Bits 3–7   : parent_slot (slot index within the parent, 0..31)
+ *   Bits 8–63  : actual parent pointer (256-byte aligned)
+ */
+#define MAPLE_NODE_MASK          0xFFUL
+#define MAPLE_PARENT_ROOT        0x01UL
+#define MAPLE_PARENT_TYPE_MASK   0x06UL
+#define MAPLE_PARENT_TYPE_SHIFT  1
+#define MAPLE_PARENT_SLOT_MASK   0xF8UL
+#define MAPLE_PARENT_SLOT_SHIFT  3
+
+/* ----------------------------------------------------------------------- */
 /*  Node structure                                                          */
 /* ----------------------------------------------------------------------- */
 
 /**
- * struct maple_node - A single B-tree node.
+ * struct maple_node - A single B-tree node (256-byte aligned).
  *
- * @parent:      Tagged pointer to parent.  Bit 0 = "is root".
- * @type:        maple_leaf_64 or maple_arange_64.
- * @slot_len:    Number of slots in use (1..MAPLE_NODE_SLOTS).
- * @parent_slot: Slot index within the parent node (0..15).
- * @pivot:       Separating keys — pivot[i] is the inclusive upper bound
- *               of slot[i].  The last slot extends to the node's max.
- * @slot:        Pointers — child nodes (internal) or entries (leaf).
- * @gap:         (arange_64 only) Largest gap under each child subtree.
+ * @parent:   Tagged pointer to parent.  Low 8 bits encode root flag,
+ *            node type, and slot index within the parent (see above).
+ * @slot_len: Number of slots in use (1..MAPLE_NODE_SLOTS).
+ * @pivot:    Separating keys — pivot[i] is the inclusive upper bound
+ *            of slot[i].  The last slot extends to the node's max.
+ * @slot:     Pointers — child nodes (internal) or entries (leaf).
+ * @gap:      (arange_64 only) Largest gap under each child subtree.
  */
 struct maple_node {
     uint64_t parent;
-
-    uint8_t  type;
     uint8_t  slot_len;
-    uint8_t  parent_slot;
-    uint8_t  __pad[5];
+    uint8_t  __pad[7];
 
     uint64_t pivot[MAPLE_NODE_PIVOTS];
     void    *slot[MAPLE_NODE_SLOTS];
     uint64_t gap[MAPLE_NODE_SLOTS];
-};
+} __attribute__((aligned(256)));
 
 /* ----------------------------------------------------------------------- */
 /*  Tree root                                                               */
@@ -89,9 +105,14 @@ struct maple_node {
  * struct maple_tree - Root structure.
  *
  * @ma_root:  Tagged pointer — NULL (empty), or a node pointer | MAPLE_ROOT_NODE.
- * @ma_flags: Reserved for future flags.
+ * @ma_flags: Feature flags (e.g. MT_FLAGS_USE_RCU).
  * @ma_lock:  (MT_CONFIG_LOCK only) Per-tree lock.
  */
+
+/** Per-tree flag: use RCU copy-on-write for structural modifications.
+ *  Only meaningful when the library is compiled with MT_CONFIG_RCU. */
+#define MT_FLAGS_USE_RCU  0x01U
+
 struct maple_tree {
     void        *ma_root;
     unsigned int ma_flags;

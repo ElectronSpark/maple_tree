@@ -610,6 +610,12 @@ mas_for_each(&mas, entry, 999) {
 }
 // break 后，mas.index / mas.last 仍反映最后一个条目
 
+// --- break 后继续迭代 ---
+// 游标保留了位置，可以直接继续下一轮扫描
+mas_for_each(&mas, entry, 999) {
+    process_remaining(entry);
+}
+
 // --- 计数条目 ---
 int count = 0;
 idx = 0;
@@ -625,6 +631,92 @@ mt_for_each(&mt, entry, idx, UINT64_MAX) {
     if (n < 100)
         entries[n++] = entry;
 }
+
+// --- 按条件过滤 ---
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    struct vma *vma = entry;
+    if (vma->flags & VM_WRITE)
+        printf("可写区域: %p\n", vma);
+}
+
+// --- 查找第一个满足条件的条目 ---
+void *found = NULL;
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    if (matches(entry)) {
+        found = entry;
+        break;
+    }
+}
+
+// --- 在迭代中删除（必须用 mas_for_each） ---
+// mt_for_each 无法安全删除，因为没有游标。
+// 使用 mas_for_each 配合 mas_erase() 实现：
+MA_STATE(mas, &mt, 0, 0);
+mas_for_each(&mas, entry, UINT64_MAX) {
+    if (should_remove(entry))
+        mas_erase(&mas);          // 安全：游标会正确前进
+}
+
+// --- 在迭代中替换条目 ---
+MA_STATE(mas, &mt, 0, 0);
+mas_for_each(&mas, entry, UINT64_MAX) {
+    if (needs_update(entry)) {
+        void *new_entry = transform(entry);
+        mas_store(&mas, new_entry);
+    }
+}
+
+// --- 聚合计算：求总大小 ---
+uint64_t total_size = 0;
+idx = 0;
+mt_for_each(&mt, entry, idx, UINT64_MAX) {
+    struct region *r = entry;
+    total_size += r->size;
+}
+
+// --- 分页遍历：每次最多处理 N 个条目 ---
+#define PAGE_SIZE 64
+uint64_t cursor = 0;
+int processed;
+do {
+    processed = 0;
+    mt_for_each(&mt, entry, cursor, UINT64_MAX) {
+        process(entry);
+        if (++processed >= PAGE_SIZE)
+            break;                // cursor 已前进，下次从这里继续
+    }
+} while (processed == PAGE_SIZE);
+
+// --- 查找特定范围内的最后一个条目 ---
+void *last_entry = NULL;
+idx = 0;
+mt_for_each(&mt, entry, idx, 1000) {
+    last_entry = entry;           // 不断覆盖，循环结束后即为最后一个
+}
+
+// --- 两棵树的交集：查找两棵树中都存在条目的索引 ---
+uint64_t i = 0;
+mt_for_each(&mt_a, entry, i, UINT64_MAX) {
+    // mt_for_each 将 i 推进到条目之后，回退到条目起始
+    void *other = mtree_load(&mt_b, i - 1);
+    if (other != NULL)
+        handle_overlap(entry, other);
+}
+
+// --- 使用 mas_for_each 执行带上下文的批量操作 ---
+MA_STATE(mas, &mt, 0, 0);
+int batch = 0;
+mas_for_each(&mas, entry, UINT64_MAX) {
+    enqueue(entry);
+    if (++batch == 32) {
+        flush_batch();            // 每 32 个条目刷新一次
+        batch = 0;
+    }
+}
+if (batch > 0)
+    flush_batch();                // 处理剩余条目
 ```
 
 ---
